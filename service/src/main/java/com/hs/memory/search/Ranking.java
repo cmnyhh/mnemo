@@ -182,7 +182,17 @@ public final class Ranking {
 
     /** 注入块：按预算截断，不为了凑满预算而塞低分条目。 */
     public static String renderInjection(List<InjectionEntry> entries, int budgetChars) {
-        return renderLines(entries, "## 相关记忆（自动召回）\n", budgetChars);
+        return renderInjection(entries, budgetChars, null);
+    }
+
+    /**
+     * 带 query 的注入块：query 用来决定「长记忆该留哪一段」。
+     *
+     * <p>没有 query 时只能从头上砍，而一轮对话的时间戳和说话人在最前面、答案常常在后半句，
+     * 砍尾正好砍掉答案（LoCoMo 上实测：命中的证据条目 62.9% 被砍，答对率 79.9% → 71.8%）。
+     */
+    public static String renderInjection(List<InjectionEntry> entries, int budgetChars, String query) {
+        return renderLines(entries, "## 相关记忆（自动召回）\n", budgetChars, query);
     }
 
     /**
@@ -193,18 +203,21 @@ public final class Ranking {
      * 内容当成答案。
      */
     public static String renderRecent(List<InjectionEntry> entries, int budgetChars) {
-        return renderLines(entries, "## 最近的记忆（本轮未命中直接相关，仅供参考）\n", budgetChars);
+        return renderLines(entries, "## 最近的记忆（本轮未命中直接相关，仅供参考）\n", budgetChars, null);
     }
 
-    private static String renderLines(List<InjectionEntry> entries, String header, int budgetChars) {
+    private static String renderLines(List<InjectionEntry> entries, String header, int budgetChars,
+                                      String query) {
         if (entries.isEmpty()) {
             return "";
         }
+        int itemMax = itemBudget(budgetChars);
         StringBuilder sb = new StringBuilder(header);
         int headerLen = sb.length();
         for (InjectionEntry e : entries) {
             String line = "- [" + e.kind() + "·" + e.tier() + "·" + String.format("%.2f", e.score()) + "] "
-                    + untrusted(e.trust()) + oneLine(e.narrative()) + captions(e.assetCaptions()) + "\n";
+                    + untrusted(e.trust()) + smartTrim(e.narrative(), itemMax, query)
+                    + captions(e.assetCaptions()) + "\n";
             if (sb.length() + line.length() > budgetChars) {
                 break;
             }
@@ -212,6 +225,24 @@ public final class Ranking {
         }
         return sb.length() <= headerLen ? "" : wrap(sb.toString());
     }
+
+    /**
+     * 单条能用多少字。
+     *
+     * <p>原来写死 220。它和总预算没有关系，于是两种浪费同时存在：预算 1200 时 5 条就满，
+     * 第 6 条明明还有余量也进不来；预算 8000 时 12 条只用掉 2640，剩下 5000 字全是空的。
+     * 改成按预算取一成二：预算小的地方行为不变（仍是 220），预算宽的地方自动放宽到 900。
+     *
+     * <p>上限 900 是为了不让一条超长记忆（比如整段会话）挤掉其余条目——
+     * 注入块的价值在「多个互不相干的证据各露一面」，不在某一条特别完整。
+     */
+    static int itemBudget(int budgetChars) {
+        int adaptive = budgetChars <= 0 ? ITEM_MIN : budgetChars * 12 / 100;
+        return Math.max(ITEM_MIN, Math.min(ITEM_MAX, adaptive));
+    }
+
+    private static final int ITEM_MIN = 220;
+    private static final int ITEM_MAX = 900;
 
     private static String untrusted(String trust) {
         return com.hs.memory.guard.TrustPolicy.LOW.equals(
@@ -262,9 +293,11 @@ public final class Ranking {
             return "";
         }
         String header = "## 长期记忆（常驻）\n";
+        int itemMax = itemBudget(budgetChars);
         StringBuilder sb = new StringBuilder(header);
         for (InjectionEntry e : entries) {
-            String line = "- [" + e.kind() + "] " + untrusted(e.trust()) + oneLine(e.narrative()) + "\n";
+            String line = "- [" + e.kind() + "] " + untrusted(e.trust())
+                    + smartTrim(e.narrative(), itemMax, null) + "\n";
             if (sb.length() + line.length() > budgetChars) {
                 break;
             }
@@ -273,13 +306,157 @@ public final class Ranking {
         return sb.length() <= header.length() ? "" : wrap(sb.toString());
     }
 
-    private static String oneLine(String s) {
+    /**
+     * 把一条长记忆压进 {@code max} 字，尽量不丢答案。
+     *
+     * <p>四步：① 够短就整条给；② 保头部（时间戳 / 说话人通常在最前，丢了模型不知道在说谁）；
+     * ③ 在剩下的句子里找第一句和 query 有词面交集的，从那里往后取——答案一般在后半句；
+     * ④ 全程按句边界切，不切出半个词。
+     *
+     * <p>兜底仍是硬切：单句本身就超预算时没有句边界可用。
+     */
+    static String smartTrim(String s, int max, String query) {
         if (s == null) {
             return "";
         }
         String t = s.replaceAll("\\s+", " ").trim();
-        return t.length() <= 220 ? t : t.substring(0, 220) + "…";
+        if (max <= 0 || t.length() <= max) {
+            return t;
+        }
+        List<String> sentences = sentences(t);
+        if (sentences.size() <= 1) {
+            return t.substring(0, max) + ELLIPSIS;
+        }
+        // 头部给预算的四分之一，但不低于 24、不高于 80：够放下「On 1:14 pm on 25 May, 2023, [D2:1] Melanie:」。
+        int headBudget = Math.min(80, Math.max(24, max / 4));
+        StringBuilder head = new StringBuilder();
+        for (String sentence : sentences) {
+            if (head.length() + sentence.length() > headBudget) {
+                break;
+            }
+            head.append(sentence);
+        }
+        if (head.isEmpty()) {
+            // 第一句就超过头部预算：在它里面找最近的空格断开，别整条丢掉。
+            String first = sentences.get(0);
+            int cutAt = Math.min(headBudget, first.length());
+            int space = first.lastIndexOf(' ', cutAt);
+            if (space > headBudget / 2) {
+                cutAt = space + 1;
+            }
+            head.append(first, 0, cutAt);
+        }
+        int rest = max - head.length() - ELLIPSIS.length();
+        if (rest <= 0) {
+            return head.substring(0, Math.min(head.length(), max)) + ELLIPSIS;
+        }
+        int start = 1;
+        Set<String> terms = queryTerms(query);
+        for (int i = 1; i < sentences.size(); i++) {
+            if (hits(sentences.get(i), terms)) {
+                start = i;
+                break;
+            }
+        }
+        StringBuilder tail = new StringBuilder();
+        boolean cut = false;
+        for (int i = start; i < sentences.size(); i++) {
+            String sentence = sentences.get(i);
+            if (tail.length() + sentence.length() > rest) {
+                // 放不下就切一半——答案常常正好落在这一句里，整句丢掉是最亏的。
+                // 切点回退到最近的空格：切出半个词（"str…"）既难看，也容易被模型误读。
+                int room = rest - tail.length();
+                if (room > 0) {
+                    int cutAt = room;
+                    int space = sentence.lastIndexOf(' ', room);
+                    if (space > room / 2) {
+                        cutAt = space;
+                    }
+                    tail.append(sentence, 0, cutAt);
+                }
+                cut = true;
+                break;
+            }
+            tail.append(sentence);
+        }
+        if (tail.isEmpty()) {
+            // 命中句自己就超过剩余预算：把它硬切进来，总比什么都不留强。
+            String sentence = sentences.get(Math.min(start, sentences.size() - 1));
+            return head + ELLIPSIS + sentence.substring(0, Math.min(sentence.length(), rest)) + ELLIPSIS;
+        }
+        StringBuilder out = new StringBuilder(head);
+        if (start > 1) {
+            out.append(ELLIPSIS);
+        }
+        out.append(tail);
+        if (cut) {
+            out.append(ELLIPSIS);
+        }
+        return out.toString();
     }
+
+    private static final String ELLIPSIS = "…";
+
+    /** 按句末标点切，保留原字符（含句子之间的空格），拼回去与原文一致。 */
+    private static List<String> sentences(String t) {
+        List<String> out = new ArrayList<>();
+        int start = 0;
+        for (int i = 0; i < t.length(); i++) {
+            char c = t.charAt(i);
+            if (c == '.' || c == '!' || c == '?' || c == '。' || c == '！' || c == '？'
+                    || c == ';' || c == '；') {
+                out.add(t.substring(start, i + 1));
+                start = i + 1;
+            }
+        }
+        if (start < t.length()) {
+            out.add(t.substring(start));
+        }
+        out.removeIf(String::isBlank);
+        return out;
+    }
+
+    /**
+     * query 里能用来定位答案的词。
+     *
+     * <p>英文取长度 ≥3 的实词并剔掉疑问词——「When did ...」里的 when/did 会命中每一条带时间的记忆，
+     * 那等于没有窗口。中文按二元组（与 BM25 同一套切法），本来就都是实词。
+     */
+    static Set<String> queryTerms(String query) {
+        if (query == null || query.isBlank()) {
+            return Set.of();
+        }
+        Set<String> terms = new LinkedHashSet<>();
+        for (String token : com.hs.memory.embed.Tokenizer.tokenize(query)) {
+            if (token.length() >= 2 && !STOPWORDS.contains(token)) {
+                terms.add(token);
+            }
+        }
+        return terms;
+    }
+
+    private static boolean hits(String sentence, Set<String> terms) {
+        if (terms.isEmpty()) {
+            return false;
+        }
+        String lower = sentence.toLowerCase(java.util.Locale.ROOT);
+        for (String term : terms) {
+            if (lower.contains(term)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 英文疑问词与虚词。只影响「挑哪一段」，不影响检索本身。 */
+    private static final Set<String> STOPWORDS = Set.of(
+            "the", "and", "but", "for", "with", "that", "this", "these", "those", "from",
+            "what", "when", "where", "which", "who", "whom", "whose", "why", "how",
+            "did", "does", "was", "were", "are", "is", "has", "have", "had", "been",
+            "you", "your", "his", "her", "their", "them", "they", "she", "him",
+            "would", "could", "should", "will", "shall", "can", "may", "might", "must",
+            "about", "into", "than", "then", "there", "here", "not", "any", "all",
+            "much", "many", "some", "such", "also", "just", "very", "more", "most");
 
     /** 去重后保序，方便把两路命中交给一次 findByIds。 */
     public static List<UUID> unionIds(List<Fused> fused) {

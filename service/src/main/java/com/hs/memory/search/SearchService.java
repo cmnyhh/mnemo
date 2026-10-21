@@ -178,7 +178,14 @@ public class SearchService {
         String rerankNote = null;
         Reranker reranker = config.reranker();
         if (reranker.available()) {
-            int head = Math.min(settings.rerankTopN(), fused.size());
+            // 精排窗口至少要覆盖调用方要的条数，否则 topK 调大是空转。
+            //
+            // 0.9.5 起「精排生效时只回精排过的条目」，于是输出条数永远 ≤ rerank.top-n。
+            // 之前把 topK 从 12 调到 30、召回只从 66.1% 动到 66.6%，就是这个上限在卡着，
+            // 不是召回能力到顶了。窗口上限 64：一次 cross-encoder 打太多条会被对端超时掐断，
+            // 那会退回 RRF，比少排几条更糟。
+            int window = Math.min(Math.max(settings.rerankTopN(), topK), MAX_RERANK_WINDOW);
+            int head = Math.min(window, fused.size());
             if (head < 2) {
                 // 只有一条时精排没有比较对象，跳过；两条也要排，否则「谁更相关」永远由名次决定
                 rerankState = "skipped";
@@ -318,7 +325,8 @@ public class SearchService {
                             .toList()));
             touched.add(UUID.fromString(h.id()));
         }
-        String injection = Ranking.renderInjection(entries, settings.injectionBudgetChars());
+        // query 参与裁剪：长记忆留哪一段由它和 query 的词面交集决定，不再从头上硬砍。
+        String injection = Ranking.renderInjection(entries, settings.injectionBudgetChars(), query);
         try {
             repo.touchAccess(tenantId, touched);
         } catch (Exception e) {
@@ -331,6 +339,12 @@ public class SearchService {
 
     /** 兜底块最多几条。3 条够提醒「记忆里有这些」，再多就挤占这一轮真正的内容。 */
     private static final int FALLBACK_ITEMS = 3;
+
+    /**
+     * 精排窗口的硬上限。窗口跟随 topK 放宽，但不能无限放宽：
+     * 一次把上百条送 cross-encoder，对端多半超时，那会整体退回 RRF——比少排几条更糟。
+     */
+    private static final int MAX_RERANK_WINDOW = 64;
 
     /**
      * 无命中时的兜底：最近几条 active 记录，单独标题，明写「未命中直接相关」。

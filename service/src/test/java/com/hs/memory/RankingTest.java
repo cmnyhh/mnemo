@@ -165,4 +165,57 @@ class RankingTest {
         // 连相似度都没有：无从判断，按弃权处理，宁可不说。
         assertThat(Ranking.abstain(Double.NaN, Double.NaN, false, 0.10)).isTrue();
     }
+
+    @Test
+    void longMemoryKeepsTheSentenceThatAnswersTheQuery() {
+        // 一条远超单条上限的对话记忆（LoCoMo 的长轮次就是这个形态）：
+        // 时间戳和说话人在最前，答案在后半句。老实现从头上砍 220 字，
+        // 正好把 "love, faith and strength" 砍掉——评测里那条判错，而证据其实已经召回到了。
+        String turn = "On 10:37 am on 27 June, 2023, [D4:3] Caroline: Thanks, Melanie! "
+                + "This necklace is super special to me - a gift from my grandma in my home country, Sweden. "
+                + "She gave it to me when I was young, and it stands for love, faith and strength. "
+                + "I never take it off. ";
+        String memory = turn.repeat(4);
+        // 预算 6000 → 单条上限 720；原文约 1000 字，必然触发裁剪。
+        String block = Ranking.renderInjection(
+                List.of(new Ranking.InjectionEntry("episode", "T2", 0.89, memory)), 6000,
+                "What does Caroline's necklace symbolize?");
+        assertThat(block).contains("love, faith and strength");
+        // 头部（时间戳 / 说话人）也要在，否则模型不知道这条在说谁。
+        assertThat(block).contains("Caroline");
+        assertThat(block).contains("…");
+    }
+
+    @Test
+    void shortMemoryIsRenderedAsIs() {
+        String memory = "mnemo 每天凌晨 3 点备份 PostgreSQL";
+        String block = Ranking.renderInjection(
+                List.of(new Ranking.InjectionEntry("fact", "T1", 0.7, memory)), 1200, "备份时间");
+        assertThat(block).contains(memory);
+        assertThat(block).doesNotContain("…");
+    }
+
+    @Test
+    void generousBudgetNoLongerClipsATurn() {
+        // 预算 8000（评测/长上下文场景）：单条上限放宽到 900，一轮对话（300 字）整条进来。
+        // 老实现无论预算多大都只给 220 字，剩下的预算全空着。
+        String memory = "On 10:37 am on 27 June, 2023, [D4:3] Caroline: Thanks, Melanie! "
+                + "This necklace is super special to me - a gift from my grandma in my home country, Sweden. "
+                + "She gave it to me when I was young, and it stands for love, faith and strength. "
+                + "I never take it off.";
+        String block = Ranking.renderInjection(
+                List.of(new Ranking.InjectionEntry("episode", "T2", 0.89, memory)), 8000, "necklace");
+        assertThat(block).contains("I never take it off");
+        assertThat(block).doesNotContain("…");
+    }
+
+    @Test
+    void trimmingWithoutQueryStillWorks() {
+        // 旧签名（兜底块等）不传 query：不能抛异常，且仍要给出可读的片段。
+        String memory = "First sentence here. ".repeat(40);
+        String block = Ranking.renderInjection(
+                List.of(new Ranking.InjectionEntry("episode", "T2", 0.5, memory)), 1200);
+        assertThat(block).contains("First sentence here");
+        assertThat(block).contains("…");
+    }
 }
