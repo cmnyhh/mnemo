@@ -1,6 +1,7 @@
 package com.hs.memory.guard;
 
 import java.util.List;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -56,10 +57,31 @@ public final class WriteReview {
 
     /** 只检查内容本身，不做语义判断——宁可漏一条，也不要把正常偏好误判成攻击。 */
     public static Verdict review(String text) {
+        return review(text, Set.of());
+    }
+
+    /**
+     * 程序性记忆专用：跳过「执行命令」与「长期指令」两条。
+     *
+     * <p>这两条是给「写给未来的偏好」设计的——记忆正文里出现「执行命令」通常是有人在
+     * 试图指挥模型。而技能正文天然就是命令序列（「执行 docker compose up」），
+     * 拿同一套规则去审会把所有正常技能判成投毒，等于这个功能永远不生效。
+     *
+     * <p>不能跳的是「覆盖系统提示 / 忽略既有指令 / 索取凭据 / 外发数据 / 要求隐瞒」——
+     * 它们描述的是「让读的人偏离原任务」，在任何语境下都不该由一条历史轨迹写进技能。
+     */
+    public static Verdict reviewProcedure(String text) {
+        return review(text, Set.of("执行命令", "长期指令"));
+    }
+
+    private static Verdict review(String text, Set<String> skipLabels) {
         if (text == null || text.isBlank()) {
             return Verdict.pass();
         }
         for (Rule rule : RULES) {
+            if (skipLabels.contains(rule.label())) {
+                continue;
+            }
             Matcher m = rule.pattern().matcher(text);
             if (m.find()) {
                 String matched = m.group();

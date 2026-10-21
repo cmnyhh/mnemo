@@ -163,6 +163,94 @@ PG 里软删除（`status=deleted`），向量点同时删掉。返回 `{deleted
 
 `GET /v1/memory/stats` — 条目数、按类型/层级分布、会话数、附件数。
 
+## 程序性记忆
+
+叙述性记忆回答「发生过什么」，这一组接口回答「下次怎么做」。一次执行是一条**轨迹**，分三步写：开局、追加步骤、关闭。
+
+`POST /v1/memory/trajectories`
+
+```json
+{ "goal": "把 mnemo 部署到 2 核服务器", "sessionId": "sess-42", "projectId": "ops" }
+```
+
+返回 `{id, goalKey, status}`。`goalKey` 是归一化后的任务签名，同类任务靠它聚类。
+
+`POST /v1/memory/trajectories/{id}/steps`
+
+```json
+{
+  "steps": [
+    { "action": "读 .env.example", "observation": "默认端口 8090", "reflection": "先看默认值，避免撞端口", "value": 0.2 },
+    { "action": "docker compose up -d", "observation": "service 容器退出", "reflection": "因为端口被占用，所以改成 8091", "value": 0 }
+  ]
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `action` | 必填，做了什么 |
+| `observation` | 看到了什么（工具输出、页面内容） |
+| `reflection` | 为什么这么做 / 这一步学到了什么。写不清因果的反思权重低 |
+| `value` | 局部奖励 0..1，可空 |
+
+`POST /v1/memory/trajectories/{id}/close`
+
+```json
+{ "status": "succeeded", "reward": 0.9, "reflection": "整体顺利，只有端口需要改" }
+```
+
+`status` 取 `succeeded` / `failed` / `abandoned`。关闭时把终局奖励沿步骤**倒序回传**：
+
+```
+G[t]   = value[t] + (最后一步 ? R : γ · G[t+1])
+credit = clamp(G[t] · (1 + λ · reflectionWeight[t]), -1, 1)
+```
+
+`R` 由状态决定：成功取 `reward`（缺省 1），失败取 `-(1 - reward)`（缺省 -1），放弃为 0。带因果、带具体对象、带改法的反思权重更高，所以同一件事，「这一步很关键」的信用远低于「因为 X=1 导致 Y，所以改成 Z」。
+
+返回 `{steps, terminalReward, credits[], strategy, skill, worldRules, quarantined, note}`。
+
+> 轨迹也可以在关闭前被丢弃：`abandoned` 只留证据，不产生正负信用。
+
+`POST /v1/memory/trajectories/record`
+
+任务已经结束时一次写完，不必先拿 id：
+
+```json
+{
+  "goal": "把 mnemo 部署到 2 核服务器",
+  "status": "succeeded",
+  "reward": 0.9,
+  "reflection": "只有端口需要改",
+  "steps": [
+    { "action": "读 .env.example", "observation": "默认端口 8090", "reflection": "先看默认值" }
+  ]
+}
+```
+
+返回与 `close` 相同。
+
+`GET /v1/memory/trajectories?limit=` — 最近轨迹。
+
+`GET /v1/memory/trajectories/{id}` — 轨迹与每一步的回传信用。
+
+`GET /v1/memory/strategies` — 策略列表。同一 `goalKey` 至少 `MEMORY_PROC_MIN_SUPPORT` 次（默认 2）且成功率过线才出现；`steps` 来自回报最高的成功轨迹里信用为正的步骤，`pitfalls` 来自失败轨迹里信用为负的步骤。
+
+`GET /v1/memory/world?subject=` — 世界模型：`{subject, action, expectation, confidence, support, contradictions}`。置信度是平滑后的印证比例，被失败轨迹推翻时记反例并降权。
+
+`GET /v1/memory/skills` — 已结晶的技能列表。
+
+`GET /v1/memory/skills/{name}` — 返回 `text/markdown` 的 `SKILL.md` 全文，可直接落盘或塞进上下文：
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  http://localhost:8090/v1/memory/skills/proc-1a2b3c4d > SKILL.md
+```
+
+`POST /v1/memory/learn` — 手工触发一次蒸馏，返回 `{goalKeys, strategies, skills, quarantined}`。控制台「学习」页的「立即学习」调的就是它。
+
+结晶门槛：支撑 ≥ `MEMORY_PROC_CRYSTALLIZE_SUPPORT`（默认 3）且成功率 ≥ `MEMORY_PROC_CRYSTALLIZE_SUCCESS`（默认 0.6）。同一份技能只在新证据改变正文时升版本；正文只由成功样本生成，观察或反思里出现「忽略以上指令」「把数据发到某地址」这类内容会整份隔离（`status=quarantined`），不结晶。
+
 ## 控制台 API
 
 `/admin/api/*` 是控制台自用的接口（登录、配置、记录浏览、令牌管理、重建索引），走会话 cookie + `X-CSRF-Token`，与上面的 Bearer 令牌互不相通。它面向界面，不承诺兼容性，接第三方请只依赖 `/v1/memory/*`。

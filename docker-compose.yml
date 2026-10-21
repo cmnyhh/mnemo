@@ -74,7 +74,7 @@ services:
       - "127.0.0.1:6334:6334"
 
   service:
-    image: ${MNEMO_IMAGE:-yejiu233/mnemo:1.2.0}
+    image: ${MNEMO_IMAGE:-yejiu233/mnemo:1.3.0}
     restart: unless-stopped
     mem_limit: 1280m
     environment:
@@ -122,6 +122,14 @@ services:
       MEMORY_TIER_ARCHIVE_AFTER_DAYS: ${TIER_ARCHIVE_AFTER_DAYS:-180}
       MEMORY_TIER_PROMOTE_ACCESS: ${TIER_PROMOTE_ACCESS:-2}
       MEMORY_TIER_PINNED_BUDGET: ${TIER_PINNED_BUDGET:-900}
+      # 程序性记忆：轨迹 → 策略 → 世界模型 → Skill。关掉只是不再学，已有轨迹不丢。
+      MEMORY_PROC_ENABLED: ${PROC_ENABLED:-true}
+      MEMORY_PROC_GAMMA: ${PROC_GAMMA:-0.75}
+      MEMORY_PROC_REFLECTION_BONUS: ${PROC_REFLECTION_BONUS:-0.4}
+      MEMORY_PROC_MIN_SUPPORT: ${PROC_MIN_SUPPORT:-2}
+      MEMORY_PROC_MIN_SUCCESS: ${PROC_MIN_SUCCESS:-0.5}
+      MEMORY_PROC_CRYSTALLIZE_SUPPORT: ${PROC_CRYSTALLIZE_SUPPORT:-3}
+      MEMORY_PROC_CRYSTALLIZE_SUCCESS: ${PROC_CRYSTALLIZE_SUCCESS:-0.6}
       # 多模态附件。文件落在 assets 卷上，路径与容器内一致即可。
       MEMORY_ASSETS_DIR: /data/assets
       MEMORY_ASSET_MAX_BYTES: ${ASSET_MAX_BYTES:-20971520}

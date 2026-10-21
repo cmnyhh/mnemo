@@ -27,6 +27,12 @@ export const router = createRouter({
       component: () => import('./views/RecallView.vue'),
     },
     {
+      path: '/learning',
+      name: 'learning',
+      meta: { title: '学习' },
+      component: () => import('./views/LearningView.vue'),
+    },
+    {
       path: '/config',
       name: 'config',
       meta: { title: '配置' },

@@ -57,6 +57,13 @@ public class SettingsConfig {
             @Value("${memory.vision.api-key}") String visionApiKey,
             @Value("${memory.vision.model}") String visionModel,
             @Value("${memory.vision.timeout-ms}") int visionTimeoutMs,
+            @Value("${memory.proc.enabled}") boolean procEnabled,
+            @Value("${memory.proc.gamma}") double procGamma,
+            @Value("${memory.proc.reflection-bonus}") double procReflectionBonus,
+            @Value("${memory.proc.min-support}") int procMinSupport,
+            @Value("${memory.proc.min-success}") double procMinSuccess,
+            @Value("${memory.proc.crystallize-support}") int procCrystallizeSupport,
+            @Value("${memory.proc.crystallize-success}") double procCrystallizeSuccess,
             @Value("${memory.rls.enabled}") boolean rlsEnabled,
             @Value("${memory.rls.role}") String rlsRole) {
         return new Settings(tenant, dbUrl, dbUser, dbPassword,
@@ -72,6 +79,8 @@ public class SettingsConfig {
                 tierWorkingSetTtlHours, tierArchiveAfterDays, tierPromoteAccess, tierPinnedBudgetChars,
                 assetsDir, assetMaxBytes,
                 visionProvider, visionBaseUrl, visionApiKey, visionModel, visionTimeoutMs,
+                procEnabled, procGamma, procReflectionBonus,
+                procMinSupport, procMinSuccess, procCrystallizeSupport, procCrystallizeSuccess,
                 rlsEnabled, rlsRole);
     }
 }

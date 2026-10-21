@@ -16,6 +16,7 @@ const navItems = [
   { to: '/overview', label: '概览' },
   { to: '/records', label: '记忆库' },
   { to: '/recall', label: '召回测试' },
+  { to: '/learning', label: '学习' },
   { to: '/config', label: '配置' },
   { to: '/tokens', label: '令牌' },
   { to: '/observability', label: '观测' },

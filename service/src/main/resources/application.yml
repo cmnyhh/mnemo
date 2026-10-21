@@ -120,6 +120,20 @@ memory:
     api-key: ${MEMORY_VISION_API_KEY:}
     model: ${MEMORY_VISION_MODEL:}
     timeout-ms: ${MEMORY_VISION_TIMEOUT_MS:30000}
+  # 程序性记忆：L1 轨迹 → L2 策略 → L3 世界模型 → Skill。
+  # 只有「同类任务反复成功」才会结晶成技能，所以门槛都按「重复次数」算。
+  proc:
+    enabled: ${MEMORY_PROC_ENABLED:true}
+    # 折扣因子：越靠近终局的动作分到越多信用。0.75 = 三步之前的贡献还剩 42%
+    gamma: ${MEMORY_PROC_GAMMA:0.75}
+    # 反思加权：0.4 表示一条满权重的反思把这一步的信用放大 40%
+    reflection-bonus: ${MEMORY_PROC_REFLECTION_BONUS:0.4}
+    # 同一类任务至少跑过几次才值得总结
+    min-support: ${MEMORY_PROC_MIN_SUPPORT:2}
+    min-success: ${MEMORY_PROC_MIN_SUCCESS:0.5}
+    # 到这次数且成功率达标才结晶成可直接调用的 Skill
+    crystallize-support: ${MEMORY_PROC_CRYSTALLIZE_SUPPORT:3}
+    crystallize-success: ${MEMORY_PROC_CRYSTALLIZE_SUCCESS:0.6}
   # 行级安全（纵深防御）。业务请求声明租户后以受限角色执行，
   # 忘写 tenant_id 时数据库返回空集而不是别人的行。
   rls:

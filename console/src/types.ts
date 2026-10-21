@@ -317,3 +317,95 @@ export interface AuditList {
   actions: string[]
   retentionDays: number
 }
+
+// ---- 程序性记忆（L1 轨迹 / L2 策略 / L3 世界模型 / Skill）----
+
+export interface ProcTrajectory {
+  id: string
+  goal: string
+  goalKey: string
+  status: string
+  reward: number | null
+  stepCount: number
+  reflection?: string | null
+  sessionId?: string | null
+  projectId?: string | null
+  startedAt: string
+  closedAt?: string | null
+}
+
+export interface ProcStep {
+  idx: number
+  action: string
+  observation: string
+  reflection?: string | null
+  value?: number | null
+  reflectionWeight?: number | null
+  credit?: number | null
+}
+
+export interface ProcTrajectoryDetail {
+  trajectory: ProcTrajectory
+  steps: ProcStep[]
+}
+
+/** 策略里的一步：order 是顺序，why 来自反思，expect 来自当时的观察。 */
+export interface ProcStrategyStep {
+  order: number
+  action: string
+  why?: string | null
+  expect?: string | null
+}
+
+export interface ProcStrategy {
+  id: string
+  goalKey: string
+  name: string
+  goal: string
+  whenToUse: string
+  steps: ProcStrategyStep[]
+  pitfalls: string[]
+  support: number
+  successRate: number
+  meanReturn: number
+  status: string
+  skillId?: string | null
+  updatedAt: string
+}
+
+export interface ProcSkill {
+  name: string
+  title: string
+  description: string
+  version: number
+  evidence?: Record<string, unknown> | null
+  updatedAt: string
+}
+
+export interface ProcWorld {
+  subject: string
+  action: string
+  expectation: string
+  confidence: number
+  support: number
+  contradictions: number
+  lastSeenAt: string
+}
+
+export interface ProcThresholds {
+  minSupport: number
+  minSuccess: number
+  crystallizeSupport: number
+  crystallizeSuccess: number
+  gamma: number
+  reflectionBonus: number
+}
+
+export interface LearningOverview {
+  enabled: boolean
+  trajectories: ProcTrajectory[]
+  strategies: ProcStrategy[]
+  skills: ProcSkill[]
+  world: ProcWorld[]
+  thresholds: ProcThresholds
+}

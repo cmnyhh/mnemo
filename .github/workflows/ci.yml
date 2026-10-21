@@ -3,6 +3,8 @@ name: ci
 on:
   push:
     branches: [main]
+    # 只改文档不必跑一遍测试与前端构建
+    paths-ignore: ["**.md", "docs/**", "LICENSE", ".gitignore"]
   pull_request:
   workflow_dispatch:
 

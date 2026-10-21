@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 # Spring Boot 3 / JDK 21 服务镜像，内含构建好的控制台前端。
 #
 # 两段构建：
@@ -17,7 +18,9 @@ ARG NPM_REGISTRY=https://registry.npmmirror.com
 # 锁文件在 macOS 上生成时只记录了 darwin 那一份，Linux 上会「装成功、build 时缺 .node」
 # （npm/cli#4828）。镜像里按 package.json 现算一次，版本范围都由 package.json 钉着。
 COPY console/package.json ./
-RUN npm config set registry "${NPM_REGISTRY}" \
+# npm 缓存挂到 BuildKit cache 上：改一行业务代码不会把 node_modules 重下一遍。
+RUN --mount=type=cache,target=/root/.npm \
+    npm config set registry "${NPM_REGISTRY}" \
  && npm install --no-audit --no-fund
 
 COPY console/ ./
@@ -30,7 +33,8 @@ WORKDIR /src
 
 # 先只拷 pom 与 settings，让依赖层能被缓存
 COPY service/pom.xml service/maven-settings.xml ./
-RUN mvn -B -q -s maven-settings.xml -DskipTests dependency:go-offline
+RUN --mount=type=cache,target=/root/.m2 \
+    mvn -B -q -s maven-settings.xml -DskipTests dependency:go-offline
 
 # CI 里单测已经在独立 job 跑过了，镜像 job 传 -DskipTests 省一遍。
 # 默认留空 = 照常跑测试，部署时的行为和以前一致。
@@ -40,7 +44,8 @@ COPY service/src ./src
 # 控制台产物落在 static/：仓库里不放构建结果，避免「改了源码忘了重新生成」
 COPY --from=web /console/dist ./src/main/resources/static
 
-RUN mvn -B -q -s maven-settings.xml package ${MVN_TEST_FLAG} \
+RUN --mount=type=cache,target=/root/.m2 \
+    mvn -B -q -s maven-settings.xml package ${MVN_TEST_FLAG} \
  && mkdir -p /out \
  && find ./target -maxdepth 1 -name '*.jar' ! -name '*.original' -exec cp {} /out/app.jar \;
 

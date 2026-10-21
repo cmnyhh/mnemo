@@ -56,6 +56,15 @@ public record Settings(
         String visionApiKey,
         String visionModel,
         int visionTimeoutMs,
+        // 程序性记忆：轨迹 → 策略 → 世界模型 → Skill。参数都是「学多快」的旋钮，
+        // 和分层参数一样属于部署级策略，走环境变量、改完重启。
+        boolean procEnabled,
+        double procGamma,
+        double procReflectionBonus,
+        int procMinSupport,
+        double procMinSuccess,
+        int procCrystallizeSupport,
+        double procCrystallizeSuccess,
         // 行级安全：业务请求（/v1/memory/*）在声明租户后切到受限角色，
         // 让「忘写 tenant_id」由数据库兜住。关掉只影响纵深防御，应用层过滤仍在。
         boolean rlsEnabled,

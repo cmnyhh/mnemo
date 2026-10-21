@@ -1,232 +1,118 @@
 name: docker
 
-# 镜像只在这里构建与推送：本地和部署机都不需要能连上 Docker Hub。
-#   main        → edge / sha-xxxxxxx
-#   v1.2.3 标签 → 1.2.3 / 1.2 / latest / sha-xxxxxxx
+# 只在「发版」时构建，不再跟着每次 push 跑。
+#   v1.3.0 标签 → 1.3.0 / 1.3 / latest
+#   手动触发   → edge（可选 arch）
 #
-# Docker Hub 是主发布地，需要 DOCKERHUB_USERNAME / DOCKERHUB_TOKEN（Access Token，不是登录口令）；
-# 未配置时退回 GHCR。配了 Hub 的话，镜像先推 Hub，再把清单整份复制到 GHCR，
-# 复制失败只告警——备份仓库的授权问题不该挡住发版。
+# 只推 Docker Hub，不推 GHCR。多架构是这里最贵的一步：arm64 走 QEMU 模拟，
+# Maven 编译在模拟层里跑，一份镜像要二十多分钟。默认只出 amd64——部署机是 x86，
+# 需要 arm64（Mac 原生跑）时手动触发并勾上。
 
 on:
   push:
-    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      edge:
+        description: "推一个 edge 标签（日常预览用）"
+        type: boolean
+        default: true
+      arm64:
+        description: "同时构建 linux/arm64（QEMU 模拟，慢十几分钟）"
+        type: boolean
+        default: false
 
-# 发布不并发：两个 tag 同时推时，latest 不应互相覆盖。
 concurrency:
   group: docker-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
   contents: read
-  packages: write # GHCR
 
 jobs:
   publish:
     name: 构建并推送
-    # 只在上游仓库跑：fork 里既没有 secrets，也不该往别人的命名空间推。
+    # 只在上游仓库跑：fork 里没有 secrets，也不该往别人的命名空间推。
     if: github.repository == 'cmnyhh/mnemo'
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 45
     env:
-      HUB_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/mnemo
-      HUB_DB_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/mnemo-db
-      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/mnemo
     steps:
       - uses: actions/checkout@v4
 
-      # 不做成失败：main 上的红叉不该由「还没去填 secret」决定。
       - name: 检查 Docker Hub 凭据
         id: hub
         run: |
-          if [ -z "$DOCKERHUB_USERNAME" ] || [ -z "$DOCKERHUB_TOKEN" ]; then
-            echo "::notice title=仅发布 GHCR::未配置 DOCKERHUB_USERNAME / DOCKERHUB_TOKEN"
-            echo "ok=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "ok=true" >> "$GITHUB_OUTPUT"
+          if [ -z "${{ secrets.DOCKERHUB_USERNAME }}" ] || [ -z "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
+            echo "::error title=缺少 Docker Hub 凭据::配置 DOCKERHUB_USERNAME / DOCKERHUB_TOKEN 后再发版"
+            exit 1
           fi
 
-      # arm64 走 QEMU 交叉构建：Mac 与 ARM 服务器拉下来能直接跑。
       - uses: docker/setup-qemu-action@v3
+        if: github.event_name == 'workflow_dispatch' && inputs.arm64
       - uses: docker/setup-buildx-action@v3
 
       - uses: docker/login-action@v3
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: docker/login-action@v3
-        if: steps.hub.outputs.ok == 'true'
-        with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # 两份 metadata：GHCR 一定有，Hub 那份只在有凭据时产出。
-      # 标签合并后交给同一次构建，避免为两个仓库各编一遍多架构镜像。
-      - name: 标签 · GHCR
-        id: meta-ghcr
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
-            type=sha,prefix=sha-
-
-      - name: 标签 · Docker Hub
-        id: meta-hub
-        if: steps.hub.outputs.ok == 'true'
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.HUB_IMAGE }}
-          tags: |
-            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
-            type=sha,prefix=sha-
-
-      # 主发布地是 Docker Hub：先推它，GHCR 只在后面做镜像同步。
-      # 没有 Hub 凭据（fork、或还没配 secret）时退回 GHCR，至少留下一个能拉的镜像。
-      - name: 汇总标签
-        id: svc-tags
+      # 平台默认只看仓库变量，省得每次都点一次勾选
+      - name: 计算平台
+        id: plat
         run: |
-          if [ "${{ steps.hub.outputs.ok }}" = "true" ]; then
-            SRC="${{ steps.meta-hub.outputs.tags }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.arm64 }}" = "true" ]; then
+            echo "platforms=linux/amd64,linux/arm64" >> "$GITHUB_OUTPUT"
           else
-            SRC="${{ steps.meta-ghcr.outputs.tags }}"
+            echo "platforms=linux/amd64" >> "$GITHUB_OUTPUT"
           fi
-          TAGS=$(printf '%s\n' "$SRC" | sed '/^$/d' | paste -sd, -)
-          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
 
-      - name: 构建并推送服务镜像
+      - name: 标签
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=edge,enable=${{ github.event_name == 'workflow_dispatch' && inputs.edge }}
+            type=sha,prefix=sha-
+
+      - name: 构建并推送
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./service/Dockerfile
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ steps.plat.outputs.platforms }}
           push: true
           build-args: |
             MVN_TEST_FLAG=-DskipTests
             NPM_REGISTRY=https://registry.npmjs.org
-          tags: ${{ steps.svc-tags.outputs.tags }}
-          labels: ${{ steps.meta-ghcr.outputs.labels }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # GHCR 只是备份：把 Hub 上刚推好的多架构清单整份复制过去，不重新构建一次。
-      # 失败不拦发布——Hub 上已经有镜像了，GHCR 侧的问题不该让发版变红。
-      - name: 镜像同步到 GHCR
-        if: steps.hub.outputs.ok == 'true'
-        continue-on-error: true
-        run: |
-          set -eu
-          fail=0
-          while read -r ref; do
-            [ -n "$ref" ] || continue
-            if docker buildx imagetools create -t "$ref" "docker.io/$HUB_IMAGE:${ref##*:}"; then
-              echo "$ref ← docker.io/$HUB_IMAGE:${ref##*:}"
-            else
-              echo "::warning::$ref 同步失败（GHCR 包可能没给这个仓库写权限）"
-              fail=1
-            fi
-          done <<< "${{ steps.meta-ghcr.outputs.tags }}"
-          exit $fail
-
-      # 数据库镜像带 pg_textsearch 扩展，与前端无关，单独一份缓存。
-      - name: 标签 · GHCR（数据库）
-        id: meta-db-ghcr
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${{ github.repository }}-db
-          tags: |
-            type=raw,value=18
-            type=sha,prefix=18-
-
-      - name: 标签 · Docker Hub（数据库）
-        id: meta-db-hub
-        if: steps.hub.outputs.ok == 'true'
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.HUB_DB_IMAGE }}
-          tags: |
-            type=raw,value=18
-            type=sha,prefix=18-
-
-      - name: 汇总标签（数据库）
-        id: db-tags
-        run: |
-          if [ "${{ steps.hub.outputs.ok }}" = "true" ]; then
-            SRC="${{ steps.meta-db-hub.outputs.tags }}"
-          else
-            SRC="${{ steps.meta-db-ghcr.outputs.tags }}"
-          fi
-          TAGS=$(printf '%s\n' "$SRC" | sed '/^$/d' | paste -sd, -)
-          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
-
-      - name: 构建并推送数据库镜像
-        uses: docker/build-push-action@v6
-        with:
-          context: ./db
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.db-tags.outputs.tags }}
-          labels: ${{ steps.meta-db-ghcr.outputs.labels }}
-          cache-from: type=gha,scope=db
-          cache-to: type=gha,mode=max,scope=db
-
-      - name: 数据库镜像同步到 GHCR
-        if: steps.hub.outputs.ok == 'true'
-        continue-on-error: true
-        run: |
-          set -eu
-          fail=0
-          while read -r ref; do
-            [ -n "$ref" ] || continue
-            if docker buildx imagetools create -t "$ref" "docker.io/$HUB_DB_IMAGE:${ref##*:}"; then
-              echo "$ref ← docker.io/$HUB_DB_IMAGE:${ref##*:}"
-            else
-              echo "::warning::$ref 同步失败（GHCR 包可能没给这个仓库写权限）"
-              fail=1
-            fi
-          done <<< "${{ steps.meta-db-ghcr.outputs.tags }}"
-          exit $fail
-
       # 默认新建的 Hub 仓库是公开的；一旦被改成私有，外面就拉不动了，而推送本身不会报错。
       # 用匿名令牌取一次清单：拿不到 pull 权限就会是 401。
-      - name: 校验 Hub 仓库可匿名拉取
-        if: steps.hub.outputs.ok == 'true'
+      - name: 校验可匿名拉取
         env:
           NS: ${{ secrets.DOCKERHUB_USERNAME }}
-          TAG: ${{ steps.meta-hub.outputs.version }}
+          TAG: ${{ steps.meta.outputs.version }}
         run: |
-          fail=0
-          check() {
-            tok=$(curl -fsS "https://auth.docker.io/token?service=registry.docker.io&scope=repository:$NS/$1:pull" \
-              | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])') || { echo "::error::取匿名令牌失败"; exit 1; }
-            code=$(curl -s -o /dev/null -w '%{http_code}' \
-              -H "Authorization: Bearer $tok" \
-              -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
-              "https://registry-1.docker.io/v2/$NS/$1/manifests/$2")
-            echo "$NS/$1:$2 匿名拉取 → HTTP $code"
-            [ "$code" = "200" ] || fail=1
-          }
-          check mnemo "$TAG"
-          check mnemo-db 18
-          if [ "$fail" = "1" ]; then
-            echo "::error title=Hub 仓库不可匿名拉取::到 Docker Hub 把 $NS/mnemo 与 $NS/mnemo-db 设为 Public"
-            exit 1
-          fi
+          tok=$(curl -fsS "https://auth.docker.io/token?service=registry.docker.io&scope=repository:$NS/mnemo:pull" \
+            | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])')
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer $tok" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
+            "https://registry-1.docker.io/v2/$NS/mnemo/manifests/$TAG")
+          echo "$NS/mnemo:$TAG 匿名拉取 → HTTP $code"
+          [ "$code" = "200" ] || { echo "::error title=Hub 仓库不可匿名拉取::到 Docker Hub 把 $NS/mnemo 设为 Public"; exit 1; }
 
-      # 推上去的仓库默认没有简介，Hub 页面上就是一片空白。这里补一次，失败不算发布失败。
-      - name: 补齐 Hub 仓库简介
-        if: steps.hub.outputs.ok == 'true'
+      # 推上去的仓库默认没有简介，Hub 页面上就是一片空白。失败不算发布失败。
+      - name: 补齐仓库简介
         env:
           NS: ${{ secrets.DOCKERHUB_USERNAME }}
           U: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -236,9 +122,6 @@ jobs:
             ## mnemo
 
             Self-hosted long-term memory for AI agents. PostgreSQL holds the record, Qdrant holds the vectors, and the two are rebuilt from the record whenever models change.
-
-            - `mnemo` — the service and its web console
-            - `mnemo-db` — PostgreSQL 18 with the full-text extension it needs
 
             ```bash
             git clone https://github.com/cmnyhh/mnemo.git && cd mnemo
@@ -253,10 +136,8 @@ jobs:
             -d "{\"username\":\"$U\",\"password\":\"$P\"}" \
             | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])') || { echo "::warning::登录 Hub 失败，跳过简介"; exit 0; }
           body=$(jq -n --arg d "$DESC" --arg f "$FULL" '{description:$d, full_description:$f, is_private:false}')
-          for name in mnemo mnemo-db; do
-            code=$(curl -s -o /tmp/hub.json -w '%{http_code}' -X PATCH \
-              -H "Authorization: Bearer $tok" -H 'Content-Type: application/json' \
-              -d "$body" "https://hub.docker.com/v2/repositories/$NS/$name/")
-            echo "$NS/$name 简介 → HTTP $code"
-            [ "$code" = "200" ] || echo "::warning::$NS/$name 简介更新失败：$(head -c 200 /tmp/hub.json)"
-          done
+          code=$(curl -s -o /tmp/hub.json -w '%{http_code}' -X PATCH \
+            -H "Authorization: Bearer $tok" -H 'Content-Type: application/json' \
+            -d "$body" "https://hub.docker.com/v2/repositories/$NS/mnemo/")
+          echo "$NS/mnemo 简介 → HTTP $code"
+          [ "$code" = "200" ] || echo "::warning::$NS/mnemo 简介更新失败：$(head -c 200 /tmp/hub.json)"

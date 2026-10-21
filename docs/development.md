@@ -120,7 +120,7 @@ bash scripts/invariants.sh
 推送完会再取一次匿名令牌校验 `mnemo` 与 `mnemo-db` 能否匿名拉取——仓库被设成私有会让这一步行红，而推送本身不会报错。
 
 ```bash
-git tag v1.2.0 && git push origin v1.2.0
+git tag v1.3.0 && git push origin v1.3.0
 ```
 
 发版前同步三处版本号：`service/pom.xml`、`console/package.json`、`plugin/package.json`；`docker-compose.yml` 的默认镜像 tag 同步成新版本。

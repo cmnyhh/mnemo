@@ -41,7 +41,7 @@ The setup script prints the following:
 
 All secrets live in `.env`. Editing `.env` after the first start does not reset the console password: it is written to the database on first boot and changed from the console afterwards. To configure manually instead, follow the comments in `.env.example`.
 
-Images are built and published by GitHub Actions to [Docker Hub](https://hub.docker.com/r/yejiu233/mnemo), which is what `docker compose up` pulls by default; the same tags are mirrored to GHCR for networks that cannot reach Docker Hub — set `MNEMO_IMAGE` / `MNEMO_DB_IMAGE` to `ghcr.io/cmnyhh/mnemo:1.2.0` and `ghcr.io/cmnyhh/mnemo-db:18` to switch. To build from source instead, add the build overlay — the first build takes roughly ten minutes:
+Images are built by GitHub Actions on version tags and published to [Docker Hub](https://hub.docker.com/r/yejiu233/mnemo), which is what `docker compose up` pulls by default. Nothing is built on ordinary commits. To build from source instead, add the build overlay — the first build takes roughly ten minutes:
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
@@ -81,6 +81,8 @@ curl -s -X POST https://<your-host>/v1/memory/search \
 
 The plugin ([`plugin/`](plugin/README.md)) writes after each turn, injects before the next one, and registers recall as a tool the model can call on its own.
 
+To teach a procedure rather than a fact, post the finished run to `/v1/memory/trajectories/record` with the goal, the steps and the outcome. Once that kind of task has succeeded often enough, `/v1/memory/skills/{name}` returns a ready-to-use `SKILL.md`.
+
 ## Capabilities
 
 **Durable entries, not transcripts.** Conversations are reduced to discrete facts and preferences at write time, each with its own subject, validity and source. Entries can be superseded, forgotten, or pinned without touching the rest of the store.
@@ -90,6 +92,8 @@ The plugin ([`plugin/`](plugin/README.md)) writes after each turn, injects befor
 **Tiered visibility.** Pinned entries are injected every turn, working-set entries expire with the session, the long-term tier is retrieved by default, and archived entries stay out of results until explicitly requested.
 
 **Memory is data, not instructions.** Injected content is wrapped and labelled as historical record. Content arriving from external sources is downgraded and marked, so text that reads like a command does not acquire authority.
+
+**Procedures that become skills.** Besides what happened, mnemo records how a task was done: each step keeps its action, observation, reflection and a value. When a run closes, the outcome is propagated back along the steps, with a concrete reflection weighing more than a vague one. Repeated success in the same kind of task becomes a strategy; a strategy with enough evidence is crystallised into a `SKILL.md` you can fetch and execute. Only successful runs are used, and a step whose observation reads like an instruction quarantines the whole strategy.
 
 **Observed, not guessed.** Recall latency is reported per stage — embedding, keyword, vector, rerank — and exported at `/internal/metrics` for Prometheus; every console action lands in an audit log with actor, target and source address.
 

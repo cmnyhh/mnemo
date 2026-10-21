@@ -22,6 +22,7 @@ public final class TestSettings {
                 24, 180, 2, 900,
                 "/tmp/dsh-memory-assets", 20971520,
                 "none", "", "", "", 30000,
+                true, 0.75, 0.4, 2, 0.5, 3, 0.6,
                 true, "memory_app");
     }
 
@@ -38,6 +39,7 @@ public final class TestSettings {
                 24, 180, 2, 900,
                 "/tmp/dsh-memory-assets", 20971520,
                 "none", "", "", "", 30000,
+                true, 0.75, 0.4, 2, 0.5, 3, 0.6,
                 true, "memory_app");
     }
 
@@ -54,6 +56,7 @@ public final class TestSettings {
                 24, 180, 2, 900,
                 "/tmp/dsh-memory-assets", 20971520,
                 "none", "", "", "", 30000,
+                true, 0.75, 0.4, 2, 0.5, 3, 0.6,
                 true, "memory_app");
     }
 }

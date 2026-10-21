@@ -277,3 +277,155 @@ create index if not exists idx_audit_action on audit_log (action, occurred_at de
 
 grant select, insert, delete on audit_log to memory_app;
 grant usage, select on sequence audit_log_id_seq to memory_app;
+
+-- ---- 程序性记忆：L1 轨迹 → L2 策略 → L3 世界模型 → Skill ----
+--
+-- 叙述性记忆回答「发生过什么」，这几张表回答「下次怎么做」。四层各存各的，
+-- 不塞进 memory_item：一个刻意设计的约束是，Skill 的正文只由「成功的轨迹」生成，
+-- 而轨迹本身可能含投毒内容，所以它在结晶前要过一遍 WriteReview（见 ProcedureService）。
+--
+-- L1 一条轨迹 = 一个目标 + 若干步（动作 / 观察 / 反思 / 局部价值）。
+-- 关闭时才回传信用（credit），因为「这一步到底有没有用」要等终局奖励出来才知道。
+create table if not exists proc_trajectory (
+  id           uuid primary key default gen_random_uuid(),
+  tenant_id    text not null,
+  user_id      text not null default '',
+  project_id   text,
+  session_id   text,
+  -- 目标原文给人看，goal_key 是归一化后的聚类签名：「同一类任务」靠它归并
+  goal         text not null,
+  goal_key     text not null,
+  status       text not null default 'open'
+                 check (status in ('open','succeeded','failed','abandoned')),
+  -- 终局奖励 0..1，调用方可给；不给时成功记 1、失败记 0
+  reward       real,
+  step_count   integer not null default 0,
+  -- 整条轨迹的反思：成功/失败到底因为什么。它参与策略的 when_to_use 与 pitfalls
+  reflection   text,
+  strategy_id  uuid,
+  started_at   timestamptz not null default now(),
+  closed_at    timestamptz
+);
+
+create index if not exists idx_traj_goal
+  on proc_trajectory (tenant_id, goal_key, closed_at desc);
+create index if not exists idx_traj_recent
+  on proc_trajectory (tenant_id, started_at desc);
+
+-- 局部价值 value 由调用方按步给（0..1，可空）；reflection_weight 由文本启发式算出；
+-- credit 是回传后的信用，正数=这一步对结果有贡献，负数=这一步是失败的原因。
+create table if not exists proc_step (
+  id                bigserial primary key,
+  tenant_id         text not null,
+  trajectory_id     uuid not null references proc_trajectory(id) on delete cascade,
+  idx               integer not null,
+  action            text not null,
+  observation       text not null default '',
+  reflection        text,
+  value             real,
+  reflection_weight real,
+  credit            real,
+  created_at        timestamptz not null default now(),
+  unique (trajectory_id, idx)
+);
+
+create index if not exists idx_step_traj on proc_step (trajectory_id, idx);
+
+-- L2 策略：同一 goal_key 下反复成功的路径。steps 是 [{order,action,why,expect}]，
+-- pitfalls 来自失败轨迹里信用为负的步。support/success_rate 是它值不值得信的全部依据。
+create table if not exists proc_strategy (
+  id           uuid primary key default gen_random_uuid(),
+  tenant_id    text not null,
+  goal_key     text not null,
+  name         text not null,
+  goal         text not null,
+  when_to_use  text not null,
+  steps        jsonb not null default '[]'::jsonb,
+  pitfalls     jsonb not null default '[]'::jsonb,
+  support      integer not null default 0,
+  success_rate real not null default 0,
+  mean_return  real not null default 0,
+  status       text not null default 'candidate'
+                 check (status in ('candidate','active','quarantined','retired')),
+  skill_id     uuid,
+  created_at   timestamptz not null default now(),
+  updated_at   timestamptz not null default now(),
+  unique (tenant_id, goal_key)
+);
+
+-- L3 世界模型：动作 → 预期观察。它不是「事实」，是「在此类任务里这样做通常会看到什么」，
+-- 所以用 support/contradictions 表达置信度，被反例推翻就降权，而不是直接删掉。
+-- key = md5(subject|action|expectation)：三段都是长文本，直接建唯一索引会超 btree 行宽。
+create table if not exists proc_world (
+  id             uuid primary key default gen_random_uuid(),
+  tenant_id      text not null,
+  subject        text not null,
+  action         text not null,
+  expectation    text not null,
+  dedupe_key     text not null,
+  confidence     real not null default 0.5,
+  support        integer not null default 1,
+  contradictions integer not null default 0,
+  last_seen_at   timestamptz not null default now(),
+  created_at     timestamptz not null default now(),
+  unique (tenant_id, dedupe_key)
+);
+
+create index if not exists idx_world_subject
+  on proc_world (tenant_id, subject, confidence desc);
+
+-- 结晶产物：一份可直接给 agent 读的 SKILL.md。同一份技能会因新证据升版本，
+-- 旧版本保留（status=retired），因为「它是怎么一步步变好的」本身值得留痕。
+create table if not exists proc_skill (
+  id          uuid primary key default gen_random_uuid(),
+  tenant_id   text not null,
+  name        text not null,
+  title       text not null,
+  description text not null,
+  body        text not null,
+  version     integer not null default 1,
+  strategy_id uuid,
+  evidence    jsonb not null default '{}'::jsonb,
+  status      text not null default 'active' check (status in ('active','retired')),
+  created_at  timestamptz not null default now(),
+  updated_at  timestamptz not null default now(),
+  unique (tenant_id, name, version)
+);
+
+create index if not exists idx_skill_active
+  on proc_skill (tenant_id, updated_at desc) where status = 'active';
+
+alter table proc_trajectory enable row level security;
+alter table proc_step enable row level security;
+alter table proc_strategy enable row level security;
+alter table proc_world enable row level security;
+alter table proc_skill enable row level security;
+
+drop policy if exists tenant_isolation on proc_trajectory;
+create policy tenant_isolation on proc_trajectory
+  using (tenant_id = current_setting('app.tenant_id', true))
+  with check (tenant_id = current_setting('app.tenant_id', true));
+
+drop policy if exists tenant_isolation on proc_step;
+create policy tenant_isolation on proc_step
+  using (tenant_id = current_setting('app.tenant_id', true))
+  with check (tenant_id = current_setting('app.tenant_id', true));
+
+drop policy if exists tenant_isolation on proc_strategy;
+create policy tenant_isolation on proc_strategy
+  using (tenant_id = current_setting('app.tenant_id', true))
+  with check (tenant_id = current_setting('app.tenant_id', true));
+
+drop policy if exists tenant_isolation on proc_world;
+create policy tenant_isolation on proc_world
+  using (tenant_id = current_setting('app.tenant_id', true))
+  with check (tenant_id = current_setting('app.tenant_id', true));
+
+drop policy if exists tenant_isolation on proc_skill;
+create policy tenant_isolation on proc_skill
+  using (tenant_id = current_setting('app.tenant_id', true))
+  with check (tenant_id = current_setting('app.tenant_id', true));
+
+grant select, insert, update, delete
+  on proc_trajectory, proc_step, proc_strategy, proc_world, proc_skill to memory_app;
+grant usage, select on sequence proc_step_id_seq to memory_app;

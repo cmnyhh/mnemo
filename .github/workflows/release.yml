@@ -17,10 +17,7 @@ jobs:
     # 只在上游仓库跑：fork 里既没有 secrets，也不该往 npm 上发包。
     if: github.repository == 'cmnyhh/mnemo'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: read
-      id-token: write # provenance
+    timeout-minutes: 10
     defaults:
       run:
         working-directory: plugin
@@ -61,6 +58,6 @@ jobs:
 
       - name: 发布
         if: steps.creds.outputs.ok == 'true'
-        run: npm publish --provenance --access public
+        run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
