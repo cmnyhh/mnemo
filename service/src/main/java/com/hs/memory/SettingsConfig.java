@@ -1,0 +1,77 @@
+package com.hs.memory;
+
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+public class SettingsConfig {
+
+    @Bean
+    public Settings settings(
+            @Value("${memory.api.tenant}") String tenant,
+            @Value("${spring.datasource.url}") String dbUrl,
+            @Value("${spring.datasource.username}") String dbUser,
+            @Value("${spring.datasource.password}") String dbPassword,
+            @Value("${memory.qdrant.url}") String qdrantUrl,
+            @Value("${memory.qdrant.api-key}") String qdrantApiKey,
+            @Value("${memory.qdrant.collection}") String qdrantCollection,
+            @Value("${memory.qdrant.timeout-ms}") int qdrantTimeoutMs,
+            @Value("${memory.qdrant.wait}") boolean qdrantWait,
+            @Value("${memory.embedding.provider}") String embeddingProvider,
+            @Value("${memory.embedding.base-url}") String embeddingBaseUrl,
+            @Value("${memory.embedding.api-key}") String embeddingApiKey,
+            @Value("${memory.embedding.model}") String embeddingModel,
+            @Value("${memory.embedding.dims}") int embeddingDims,
+            @Value("${memory.embedding.timeout-ms}") int embeddingTimeoutMs,
+            @Value("${memory.search.bm25-top-k}") int bm25TopK,
+            @Value("${memory.search.dense-top-k}") int denseTopK,
+            @Value("${memory.search.rrf-k}") int rrfK,
+            @Value("${memory.search.default-top-k}") int defaultTopK,
+            @Value("${memory.search.max-top-k}") int maxTopK,
+            @Value("${memory.search.abstain-threshold}") double abstainThreshold,
+            @Value("${memory.search.injection-budget-chars}") int injectionBudgetChars,
+            @Value("${memory.search.dense-min-score}") double denseMinScore,
+            @Value("${memory.rerank.provider}") String rerankProvider,
+            @Value("${memory.rerank.base-url}") String rerankBaseUrl,
+            @Value("${memory.rerank.api-key}") String rerankApiKey,
+            @Value("${memory.rerank.model}") String rerankModel,
+            @Value("${memory.rerank.timeout-ms}") int rerankTimeoutMs,
+            @Value("${memory.rerank.top-n}") int rerankTopN,
+            @Value("${memory.rerank.skip-gap}") double rerankSkipGap,
+            @Value("${memory.extract.provider}") String extractProvider,
+            @Value("${memory.extract.base-url}") String extractBaseUrl,
+            @Value("${memory.extract.api-key}") String extractApiKey,
+            @Value("${memory.extract.model}") String extractModel,
+            @Value("${memory.extract.timeout-ms}") int extractTimeoutMs,
+            @Value("${memory.extract.max-items}") int extractMaxItems,
+            @Value("${memory.extract.min-confidence}") double extractMinConfidence,
+            @Value("${memory.tier.working-set-ttl-hours}") int tierWorkingSetTtlHours,
+            @Value("${memory.tier.archive-after-days}") int tierArchiveAfterDays,
+            @Value("${memory.tier.promote-access}") int tierPromoteAccess,
+            @Value("${memory.tier.pinned-budget-chars}") int tierPinnedBudgetChars,
+            @Value("${memory.assets.dir}") String assetsDir,
+            @Value("${memory.assets.max-bytes}") long assetMaxBytes,
+            @Value("${memory.vision.provider}") String visionProvider,
+            @Value("${memory.vision.base-url}") String visionBaseUrl,
+            @Value("${memory.vision.api-key}") String visionApiKey,
+            @Value("${memory.vision.model}") String visionModel,
+            @Value("${memory.vision.timeout-ms}") int visionTimeoutMs,
+            @Value("${memory.rls.enabled}") boolean rlsEnabled,
+            @Value("${memory.rls.role}") String rlsRole) {
+        return new Settings(tenant, dbUrl, dbUser, dbPassword,
+                qdrantUrl, qdrantApiKey, qdrantCollection, qdrantTimeoutMs, qdrantWait,
+                embeddingProvider, embeddingBaseUrl, embeddingApiKey, embeddingModel,
+                embeddingDims, embeddingTimeoutMs,
+                bm25TopK, denseTopK, rrfK, defaultTopK, maxTopK,
+                abstainThreshold, injectionBudgetChars, denseMinScore,
+                rerankProvider, rerankBaseUrl, rerankApiKey, rerankModel,
+                rerankTimeoutMs, rerankTopN, rerankSkipGap,
+                extractProvider, extractBaseUrl, extractApiKey, extractModel,
+                extractTimeoutMs, extractMaxItems, extractMinConfidence,
+                tierWorkingSetTtlHours, tierArchiveAfterDays, tierPromoteAccess, tierPinnedBudgetChars,
+                assetsDir, assetMaxBytes,
+                visionProvider, visionBaseUrl, visionApiKey, visionModel, visionTimeoutMs,
+                rlsEnabled, rlsRole);
+    }
+}

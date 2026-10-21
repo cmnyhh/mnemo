@@ -1,0 +1,31 @@
+{
+  "name": "mnemo 召回评测集 · 模板",
+  "note": "expect_ids 从 memory_item.id 取：select id, narrative from memory_item where status='active'。expect_ids 为空表示「这条应该弃权」。",
+  "cases": [
+    {
+      "query": "mnemo 的排序模型是什么",
+      "expect_ids": ["REPLACE-WITH-REAL-UUID"],
+      "note": "词汇鸿沟：原文只有『精排』，靠 recall_hints 命中"
+    },
+    {
+      "query": "服务部署在哪台机器上",
+      "expect_ids": [],
+      "note": "库里没有这条时应弃权，而不是硬塞一条不相干的"
+    },
+    {
+      "query": "红烧肉怎么做好吃",
+      "expect_ids": [],
+      "note": "明显无关"
+    },
+    {
+      "query": "zzqqxx",
+      "expect_ids": [],
+      "note": "乱码，qwen3 对乱码也能给 0.5 相似度，专治阈值过松"
+    },
+    {
+      "query": "以后给领导的文档怎么写",
+      "expect_ids": ["REPLACE-WITH-PREFERENCE-UUID"],
+      "note": "偏好类，应命中 preference；拿不到 id 就删掉这条，别留空数组——空数组在脚本里等于『应弃权』"
+    }
+  ]
+}

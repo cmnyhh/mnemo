@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  这台机器到 repo1.maven.org 通但慢（1.3s 首包），阿里云镜像 35ms。
+  构建时统一走镜像；镜像挂了再临时去掉 -s 参数。
+-->
+<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0 https://maven.apache.org/xsd/settings-1.0.0.xsd">
+  <mirrors>
+    <mirror>
+      <id>aliyun-public</id>
+      <name>aliyun public</name>
+      <mirrorOf>central</mirrorOf>
+      <url>https://maven.aliyun.com/repository/public</url>
+    </mirror>
+  </mirrors>
+</settings>

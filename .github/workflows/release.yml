@@ -1,0 +1,66 @@
+name: release
+
+# 打 tag 时发布插件到 npm。镜像由 docker.yml 负责，两者互不依赖。
+# 需要仓库 Secrets：NPM_TOKEN。
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  npm:
+    name: 插件 → npm
+    # 只在上游仓库跑：fork 里既没有 secrets，也不该往 npm 上发包。
+    if: github.repository == 'cmnyhh/mnemo'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write # provenance
+    defaults:
+      run:
+        working-directory: plugin
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # 没配 NPM_TOKEN 时跳过而不是失败：发版的红叉应当只代表真的发不出去。
+      - name: 检查凭据
+        id: creds
+        run: |
+          if [ -z "$NPM_TOKEN" ]; then
+            echo "::notice title=跳过 npm 发布::仓库未配置 NPM_TOKEN"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-node@v4
+        if: steps.creds.outputs.ok == 'true'
+        with:
+          node-version: "22"
+          registry-url: https://registry.npmjs.org
+          cache: npm
+          cache-dependency-path: plugin/package-lock.json
+
+      # 锁文件只带生成时那一个平台的 esbuild 二进制（npm/cli#4828），
+      # runner 是 linux，丢掉锁现算一次。
+      - run: rm -f package-lock.json && npm install --no-audit --no-fund
+        if: steps.creds.outputs.ok == 'true'
+
+      # prepublishOnly 也会重新打包一次，这里先跑是为了让冒烟测到真正要发的产物
+      - run: npm run build
+        if: steps.creds.outputs.ok == 'true'
+      - run: npm run smoke
+        if: steps.creds.outputs.ok == 'true'
+
+      - name: 发布
+        if: steps.creds.outputs.ok == 'true'
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

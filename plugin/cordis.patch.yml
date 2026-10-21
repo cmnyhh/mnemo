@@ -1,0 +1,21 @@
+# mnemo 插件的默认配置。
+#
+# 这里只放「对所有人都成立」的值。令牌是个人凭据，所以写的是间接引用，
+# 由插件在加载时解析：
+#   env:NAME    读环境变量
+#   file:/path  读文件（末尾换行会被去掉）
+#
+# 想改成本机部署的地址，在 profile 自己的 cordis.patch.yml 里覆盖 serviceUrl
+# （覆盖会替换整块 config，没写的键会回到 schema 默认值）。
+- insert:
+    - id: memory-core
+      name: 'mnemo-memory-core'
+      config:
+        # 本机 docker compose 起的服务。远程部署改成 https://<域名>
+        serviceUrl: 'http://127.0.0.1:8090'
+        serviceToken: 'env:MNEMO_SERVICE_TOKEN'
+        projectId: 'default'
+        serviceTimeoutMs: 1200
+        writeTimeoutMs: 20000
+        topK: 6
+        toolName: memory_search

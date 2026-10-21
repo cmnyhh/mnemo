@@ -1,0 +1,20 @@
+# 运行时密钥与数据
+.env
+.env.local
+backups/
+*.log
+
+# 构建产物：仓库里不放，避免「改了源码忘了重建」
+target/
+*.class
+*.jar
+console/dist/
+plugin/index.js
+*.tgz
+
+# 编辑器与系统
+.DS_Store
+.idea/
+*.iml
+.vscode/
+node_modules/

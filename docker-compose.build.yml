@@ -1,0 +1,18 @@
+# 从源码构建的叠加层：
+#
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+#
+# 单独用 docker-compose.yml 时拉的是 Docker Hub 上的预构建镜像。
+services:
+  db:
+    build:
+      context: ./db
+      args:
+        # 生产构建请钉到 release tag，main 会滚动
+        PG_TEXTSEARCH_REF: ${PG_TEXTSEARCH_REF:-main}
+
+  service:
+    build:
+      # 上下文是仓库根：镜像里要先构建 console/ 再打进 jar
+      context: .
+      dockerfile: service/Dockerfile

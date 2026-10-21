@@ -1,0 +1,495 @@
+package com.hs.memory.search;
+
+import com.hs.memory.api.SearchRequest;
+import com.hs.memory.api.SearchResponse;
+import com.hs.memory.config.RuntimeConfig;
+import com.hs.memory.embed.Tokenizer;
+import com.hs.memory.repo.ItemRow;
+import com.hs.memory.repo.MemoryRepository;
+import com.hs.memory.rerank.RerankException;
+import com.hs.memory.rerank.Reranker;
+import com.hs.memory.tier.TierPolicy;
+import com.hs.memory.vector.QdrantClient;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Service;
+
+@Service
+public class SearchService {
+
+    private static final Logger log = LoggerFactory.getLogger(SearchService.class);
+    private static final Set<String> KINDS = Set.of("preference", "fact", "episode");
+    private static final Set<String> SCOPES = Set.of("user", "project", "global", "agent");
+    /**
+     * 精排分低于这个值的条目直接丢弃，不占注入位。
+     *
+     * <p>它们能进来只是因为向量路凑满了名次（k-NN 永远有「最近的 k 个」），
+     * 精排已经明确判为不相关，再注入就只是噪声。
+     */
+    private static final double RERANK_DROP_BELOW = 0.02;
+
+    private final RuntimeConfig config;
+    private final MemoryRepository repo;
+    private final QdrantClient qdrant;
+    private final com.hs.memory.asset.AssetService assets;
+    private final com.hs.memory.obs.MetricsRecorder metrics;
+
+    public SearchService(RuntimeConfig config, MemoryRepository repo, QdrantClient qdrant,
+                         com.hs.memory.asset.AssetService assets,
+                         com.hs.memory.obs.MetricsRecorder metrics) {
+        this.config = config;
+        this.repo = repo;
+        this.qdrant = qdrant;
+        this.assets = assets;
+        this.metrics = metrics;
+    }
+
+    public SearchResponse search(String tenantId, SearchRequest req) {
+        long t0 = System.nanoTime();
+        String mode = "hybrid";
+        try {
+            SearchResponse response = doSearch(tenantId, req, t0);
+            mode = response.route();
+            metrics.search(mode, outcome(response), System.nanoTime() - t0);
+            return response;
+        } catch (RuntimeException e) {
+            // 失败也要计时：只看成功的那些，等于把最慢的请求从统计里删掉了。
+            metrics.search(mode, "error", System.nanoTime() - t0);
+            throw e;
+        }
+    }
+
+    /**
+     * 三种结果分开记：{@code empty}（两路都没候选）、{@code abstain}（有候选但没一条够格）、
+     * {@code hit}。只看错误率会把「一直在弃权」当成健康——那才是召回最隐蔽的病。
+     */
+    private static String outcome(SearchResponse r) {
+        if (!r.hits().isEmpty()) {
+            return "hit";
+        }
+        if (r.injection() == null || r.injection().isBlank()) {
+            return "empty";
+        }
+        return "abstain";
+    }
+
+    private SearchResponse doSearch(String tenantId, SearchRequest req, long t0) {
+        // 每次取一次快照：配置可能刚在控制台改过，本次请求就应按新值走。
+        RuntimeConfig.Snapshot settings = config.snapshot();
+        String query = req.query() == null ? "" : req.query().trim();
+        if (query.isEmpty()) {
+            throw new IllegalArgumentException("query 不能为空");
+        }
+        String mode = req.mode() == null ? "hybrid" : req.mode().toLowerCase(Locale.ROOT);
+        if (!Set.of("hybrid", "bm25", "dense").contains(mode)) {
+            throw new IllegalArgumentException("mode 只能是 hybrid / bm25 / dense");
+        }
+        int topK = req.topK() == null ? settings.defaultTopK() : req.topK();
+        topK = Math.max(1, Math.min(topK, settings.maxTopK()));
+
+        List<String> kinds = validate(req.kinds(), KINDS, "kinds");
+        List<String> scopes = validate(req.scopes(), SCOPES, "scopes");
+        List<String> tiers = validate(req.tiers(), Set.copyOf(TierPolicy.ALL), "tiers");
+        if (tiers.isEmpty()) {
+            tiers = TierPolicy.DEFAULT_SEARCH;
+        }
+        OffsetDateTime asOf = parseAsOf(req.asOf());
+
+        List<String> tokens = Tokenizer.tokenize(query);
+        String bm25Query = String.join(" ", tokens);
+
+        // 向量只算一次。embedding 是整条链路里最贵的一步（公网 150~560ms），一次请求只付一次。
+        float[] vector = null;
+        String embedDegrade = null;
+        if (!"bm25".equals(mode)) {
+            long stage = System.nanoTime();
+            try {
+                vector = config.embedding().embed(query);
+            } catch (Exception e) {
+                embedDegrade = "向量路降级（只走 BM25）: " + e.getMessage();
+                metrics.degrade("vector");
+                log.warn("嵌入失败，降级为 BM25: {}", e.getMessage());
+            } finally {
+                metrics.searchStage("embed", System.nanoTime() - stage);
+            }
+        }
+
+        // 检索<b>始终在租户内全域进行</b>，projectId 只作排序偏好（见 Ranking.projectBoost）。
+        //
+        // 早先是按 projectId 硬过滤，后来改成「本投影答不上来再换全租户」，两次都不对：
+        // 桌面插件写死 projectId=dsh，而记录可能写在 mnemo 投影下；只要 dsh 里有几条勉强
+        // 沾边的记录（比如问备份、dsh 里正好有一堆 Qdrant 的资料），这一次就算「答上来了」，
+        // 永远走不到全租户那一遍，真正相关的那条被挡在外面。**「答没答上来」这个中间判断
+        // 本身就是不可靠的**，不如一次就把全部候选拿出来，让相关性自己排。
+        //
+        // 隔离并没有变松：租户由令牌决定，跨租户一条都拿不到。
+        Pass pass = retrieve(tenantId, null, mode, bm25Query, kinds, scopes, tiers,
+                asOf, settings, vector);
+        return answer(tenantId, req, settings, query, asOf, topK, pass,
+                degrade(embedDegrade, pass), t0);
+    }
+
+    private static String degrade(String embedDegrade, Pass pass) {
+        if (embedDegrade == null) {
+            return pass.degradeReason();
+        }
+        return pass.degradeReason() == null ? embedDegrade : embedDegrade + "；" + pass.degradeReason();
+    }
+
+    /** 把一次检索尝试变成响应：精排、剪枝、打分、注入块。 */
+    private SearchResponse answer(String tenantId, SearchRequest req,
+                                  RuntimeConfig.Snapshot settings, String query, OffsetDateTime asOf,
+                                  int topK, Pass pass, String degradeReason, long t0) {
+        List<UUID> bm25Ids = pass.bm25Ids();
+        List<UUID> denseIds = pass.denseIds();
+        // 原始相似度留着：它不随名次归一化改变，是判断「到底有多像」的唯一凭据。
+        Map<UUID, Double> denseScores = pass.denseScores();
+        List<Ranking.Fused> fused = pass.fused();
+        if (fused.isEmpty()) {
+            return empty(query, bm25Ids.isEmpty() ? (denseIds.isEmpty() ? "none" : "dense") : "bm25",
+                    t0, degradeReason, "off");
+        }
+
+        List<UUID> ids = Ranking.unionIds(fused);
+        Map<UUID, ItemRow> rows = new HashMap<>();
+        for (ItemRow row : repo.findByIds(tenantId, ids, asOf)) {
+            rows.put(row.id(), row);
+        }
+
+        double rrfMax = fused.get(0).rrf();
+        double rrfSecond = fused.size() > 1 ? fused.get(1).rrf() : 0;
+        double gap = rrfMax <= 0 ? 0 : (rrfMax - rrfSecond) / rrfMax;
+
+        // ---- 精排：融合之后、截断之前。跳过与失败都必须能退回 RRF 顺序 ----
+        Map<UUID, Double> rerankScores = new HashMap<>();
+        String rerankState = "off";
+        String rerankNote = null;
+        Reranker reranker = config.reranker();
+        if (reranker.available()) {
+            int head = Math.min(settings.rerankTopN(), fused.size());
+            if (head < 2) {
+                // 只有一条时精排没有比较对象，跳过；两条也要排，否则「谁更相关」永远由名次决定
+                rerankState = "skipped";
+                rerankNote = "候选仅 " + head + " 条，精排没有区分空间";
+            } else if (settings.rerankSkipGap() > 0 && gap > settings.rerankSkipGap()) {
+                rerankState = "skipped";
+                rerankNote = String.format(Locale.ROOT, "第一名领先 %.2f（阈值 %.2f），跳过精排",
+                        gap, settings.rerankSkipGap());
+            } else {
+                List<UUID> headIds = new ArrayList<>();
+                List<String> docs = new ArrayList<>();
+                for (int i = 0; i < head; i++) {
+                    ItemRow row = rows.get(fused.get(i).id());
+                    if (row == null || row.narrative() == null || row.narrative().isBlank()) {
+                        continue;
+                    }
+                    headIds.add(row.id());
+                    docs.add(row.narrative());
+                }
+                if (docs.size() < 2) {
+                    rerankState = "skipped";
+                    rerankNote = "可精排的文本不足 2 条";
+                } else {
+                    long stage = System.nanoTime();
+                    try {
+                        double[] raw = reranker.score(query, docs);
+                        for (int i = 0; i < headIds.size() && i < raw.length; i++) {
+                            rerankScores.put(headIds.get(i), raw[i]);
+                        }
+                        rerankState = "applied";
+                    } catch (RerankException e) {
+                        rerankState = "failed";
+                        rerankNote = "精排失败，退回 RRF 顺序: " + e.getMessage();
+                        metrics.degrade("rerank");
+                        log.warn("rerank 降级: {}", e.getMessage());
+                    } finally {
+                        metrics.searchStage("rerank", System.nanoTime() - stage);
+                    }
+                }
+            }
+        }
+        // 精排是本链路里第二贵的调用（公网 ~120ms），它的三种状态直接影响召回质量：
+        // 一直 skipped 说明阈值设宽了，一直 failed 说明对端在超时。
+        metrics.rerank(rerankState);
+        if (rerankNote != null) {
+            degradeReason = degradeReason == null ? rerankNote : degradeReason + "；" + rerankNote;
+        }
+
+        double rrfDiv = rrfMax <= 0 ? 1 : rrfMax;
+        Instant now = Instant.now();
+        // 附件一次批量取回：逐条查会变成 N 次往返，而召回预算只有几百毫秒
+        Map<UUID, List<com.hs.memory.asset.AssetService.AssetView>> assetsByMemory = Map.of();
+        if (!ids.isEmpty()) {
+            try {
+                assetsByMemory = assets.byMemory(List.of(tenantId), ids);
+            } catch (Exception e) {
+                log.warn("附件读取失败（不影响文本召回）: {}", e.getMessage());
+            }
+        }
+        List<SearchResponse.Hit> hits = new ArrayList<>();
+        for (Ranking.Fused f : fused) {
+            ItemRow row = rows.get(f.id());
+            if (row == null) {
+                continue; // 已删除或已退休：向量库里可能还留着，以 PG 为准
+            }
+            double rrfNorm = f.rrf() / rrfDiv;
+            Double rel = rerankScores.get(f.id());
+            // 没送精排的条目用 rrfNorm 顶替 relNorm：0.55 + 0.20 恰好回到 0.75，不缩水。
+            double relNorm = rel != null ? rel : rrfNorm;
+            double recency = Ranking.recency(row.createdAt(), now, row.kind());
+            // 层级加成（T0 +0.06 / T1 +0.03 / T3 −0.12）之前漏传了，等于分层只影响治理、
+            // 不影响排序——被钉住的 T0 和普通 T2 同分。这里补上，再把「是不是本投影」作为
+            // 一个很小的偏好（0.03）加在外面：同等相关时本投影优先，但不至于压过明显更相关的
+            // 跨投影记录。
+            double score = Ranking.finalScore(rrfNorm, relNorm, recency, row.importance(),
+                    row.citedCount(), row.correctionCount(), row.trustLevel(),
+                    TierPolicy.boost(row.tier()))
+                    + Ranking.projectBoost(row.projectId(), req.projectId());
+            hits.add(new SearchResponse.Hit(
+                    row.id().toString(), row.kind(), row.scope(), row.tier(), row.trustLevel(),
+                    row.narrative(), round4(score), round6(f.rrf()), f.bm25Rank(), f.denseRank(),
+                    round4(denseScores.get(f.id())), round4(rel),
+                    round4(recency), row.importance(),
+                    asString(row.validFrom()), asString(row.validTo()), asString(row.createdAt()),
+                    assetRefs(assetsByMemory.get(f.id()))));
+        }
+
+        // 分数要在剪枝<b>之前</b>取：剪枝本身就是「这几条被判为不相关」的结论，
+        // 剪完再看就只剩没进精排窗口的条目（rerankScore 全 null），拿它们的向量分当
+        // 证据等于把精排的否决票作废——问天气也会注入四条旧记忆。
+        double bestRerank = Double.NaN;
+        double bestDense = Double.NaN;
+        for (SearchResponse.Hit h : hits) {
+            if (h.rerankScore() != null) {
+                bestRerank = Double.isNaN(bestRerank) ? h.rerankScore() : Math.max(bestRerank, h.rerankScore());
+            }
+            if (h.denseScore() != null) {
+                bestDense = Double.isNaN(bestDense) ? h.denseScore() : Math.max(bestDense, h.denseScore());
+            }
+        }
+        if ("applied".equals(rerankState)) {
+            // 精排窗口（rerank-top-n）外的条目没有精排分，它们的 relNorm 只能用 rrfNorm 顶替，
+            // 分数被抬到跟真相关的条目同一量级——混在一起排，「分数」这一列必然忽高忽低
+            // （0.765 后面跟着 0.792），而且注入块里会掺进一堆没人核过的记录。
+            // 既然这一轮已经具备判断能力（精排跑成了），就只回判断过的条目：宁可少给几条，
+            // 也不要为了凑满 topK 把「不知道好不好」的东西当成命中。
+            hits.removeIf(h -> h.rerankScore() == null);
+            hits.removeIf(h -> h.rerankScore() < RERANK_DROP_BELOW);
+        }
+        hits.sort(Comparator.comparingDouble(SearchResponse.Hit::score).reversed());
+        if (hits.size() > topK) {
+            hits = new ArrayList<>(hits.subList(0, topK));
+        }
+
+        boolean abstained = Ranking.abstain(bestRerank, bestDense, "applied".equals(rerankState),
+                settings.abstainThreshold());
+        String route = !bm25Ids.isEmpty() && !denseIds.isEmpty() ? "hybrid"
+                : (!bm25Ids.isEmpty() ? "bm25" : "dense");
+
+        if (abstained) {
+            // 弃权本身不变（c_wrong >> c_miss），但不再「什么都不给」：0.9.3 起回退到最近
+            // 几条，让模型知道记忆里存着什么。不给这一块时，问得泛一点就整块空，模型连
+            // 「有记忆系统」都不知道，也就不会去调检索工具。
+            String fallback = renderFallback(tenantId, req.projectId(), settings);
+            return new SearchResponse(query, route, true, 0, List.of(), fallback, elapsed(t0),
+                    degradeReason, rerankState);
+        }
+
+        List<Ranking.InjectionEntry> entries = new ArrayList<>();
+        List<UUID> touched = new ArrayList<>();
+        for (SearchResponse.Hit h : hits) {
+            entries.add(new Ranking.InjectionEntry(h.kind(), h.tier(), h.score(), h.narrative(),
+                    h.trustLevel(),
+                    h.assets().stream()
+                            .map(SearchResponse.AssetRef::caption)
+                            .filter(java.util.Objects::nonNull)
+                            .toList()));
+            touched.add(UUID.fromString(h.id()));
+        }
+        String injection = Ranking.renderInjection(entries, settings.injectionBudgetChars());
+        try {
+            repo.touchAccess(tenantId, touched);
+        } catch (Exception e) {
+            log.debug("access_count 更新失败（不影响召回）: {}", e.getMessage());
+        }
+
+        return new SearchResponse(query, route, false, hits.size(), hits, injection,
+                elapsed(t0), degradeReason, rerankState);
+    }
+
+    /** 兜底块最多几条。3 条够提醒「记忆里有这些」，再多就挤占这一轮真正的内容。 */
+    private static final int FALLBACK_ITEMS = 3;
+
+    /**
+     * 无命中时的兜底：最近几条 active 记录，单独标题，明写「未命中直接相关」。
+     *
+     * <p>失败一律返回空串：兜底本身是锦上添花，不能因为多查一次库就让检索报错。
+     */
+    private String renderFallback(String tenantId, String projectId, RuntimeConfig.Snapshot settings) {
+        try {
+            List<Ranking.InjectionEntry> entries = new ArrayList<>();
+            List<MemoryRepository.PinnedRow> recent = repo.listRecent(tenantId, projectId, FALLBACK_ITEMS);
+            // 投影里没有近期记录（新投影、或记录都写在别的投影下）：兜底也别空着，
+            // 退回整个租户。兜底块本来就只是「最近的记忆」，不是证据，跨投影没有误导性。
+            if (recent.isEmpty() && projectId != null && !projectId.isBlank()) {
+                recent = repo.listRecent(tenantId, null, FALLBACK_ITEMS);
+            }
+            for (MemoryRepository.PinnedRow row : recent) {
+                entries.add(new Ranking.InjectionEntry(row.kind(), row.tier(), row.importance(),
+                        row.narrative(), row.trustLevel(), List.of()));
+            }
+            return Ranking.renderRecent(entries, settings.injectionBudgetChars());
+        } catch (Exception e) {
+            log.debug("兜底注入失败（不影响检索）: {}", e.getMessage());
+            return "";
+        }
+    }
+
+    private SearchResponse empty(String query, String route, long t0, String degrade, String rerank) {
+        return new SearchResponse(query, route, true, 0, List.of(), "", elapsed(t0), degrade, rerank);
+    }
+
+    /** 一次检索尝试的结果：两路候选、融合结果与降级原因。 */
+    private record Pass(List<UUID> bm25Ids, List<UUID> denseIds, Map<UUID, Double> denseScores,
+                        List<Ranking.Fused> fused, String degradeReason) {
+    }
+
+    /**
+     * 在一个投影上跑 BM25 + 向量两路。{@code projectId} 为 null 表示不限投影。
+     *
+     * <p>{@code vector} 由调用方算好并复用；为 null 表示向量路不可用（嵌入失败或
+     * mode=bm25），此时只走 BM25，不报错。
+     */
+    private Pass retrieve(String tenantId, String projectId, String mode, String bm25Query,
+                          List<String> kinds, List<String> scopes, List<String> tiers,
+                          OffsetDateTime asOf, RuntimeConfig.Snapshot settings, float[] vector) {
+        List<UUID> bm25Ids = new ArrayList<>();
+        if (!"dense".equals(mode) && !bm25Query.isEmpty()) {
+            long stage = System.nanoTime();
+            try {
+                for (MemoryRepository.Scored s : repo.bm25(tenantId, projectId, bm25Query,
+                        kinds, scopes, tiers, asOf, settings.bm25TopK())) {
+                    bm25Ids.add(s.id());
+                }
+            } catch (Exception e) {
+                // BM25 挂了不该让整次召回失败：继续走向量
+                log.warn("bm25 查询失败: {}", e.getMessage());
+            } finally {
+                metrics.searchStage("bm25", System.nanoTime() - stage);
+            }
+        }
+
+        List<UUID> denseIds = new ArrayList<>();
+        // 原始相似度留着：它不随名次归一化改变，是判断「到底有多像」的唯一凭据。
+        Map<UUID, Double> denseScores = new HashMap<>();
+        String degradeReason = null;
+        if (vector != null && !"bm25".equals(mode)) {
+            long stage = System.nanoTime();
+            try {
+                Map<String, Object> filter = QdrantClient.filter(tenantId, projectId, "active", tiers);
+                for (QdrantClient.PointHit hit : qdrant.query(vector, settings.denseTopK(),
+                        filter, settings.denseMinScore())) {
+                    denseIds.add(hit.id());
+                    denseScores.put(hit.id(), hit.score());
+                }
+            } catch (Exception e) {
+                degradeReason = "向量路降级（只走 BM25）: " + e.getMessage();
+                metrics.degrade("vector");
+                log.warn("dense 召回失败，降级为 BM25: {}", e.getMessage());
+            } finally {
+                metrics.searchStage("dense", System.nanoTime() - stage);
+            }
+        }
+        return new Pass(bm25Ids, denseIds, denseScores,
+                Ranking.fuse(bm25Ids, denseIds, settings.rrfK()), degradeReason);
+    }
+
+    private static long elapsed(long t0) {
+        return (System.nanoTime() - t0) / 1_000_000;
+    }
+
+    private static List<SearchResponse.AssetRef> assetRefs(
+            List<com.hs.memory.asset.AssetService.AssetView> views) {
+        if (views == null || views.isEmpty()) {
+            return List.of();
+        }
+        List<SearchResponse.AssetRef> out = new ArrayList<>();
+        for (com.hs.memory.asset.AssetService.AssetView v : views) {
+            out.add(new SearchResponse.AssetRef(v.id(), v.kind(), v.mimeType(), v.caption(), v.url()));
+        }
+        return out;
+    }
+
+    private static Double round4(Double v) {
+        return v == null ? null : round4(v.doubleValue());
+    }
+
+    private static double round4(double v) {
+        return Math.round(v * 10000.0) / 10000.0;
+    }
+
+    private static double round6(double v) {
+        return Math.round(v * 1_000_000.0) / 1_000_000.0;
+    }
+
+    private static String asString(Instant i) {
+        return i == null ? null : i.toString();
+    }
+
+    /** 层级用大写存储，所以不能复用下面那个会转小写的 validate。 */
+    private static List<String> validateTiers(List<String> values) {
+        if (values == null || values.isEmpty()) {
+            return List.of();
+        }
+        List<String> out = new ArrayList<>();
+        for (String v : values) {
+            String t = v == null ? "" : v.trim().toUpperCase(Locale.ROOT);
+            if (!TierPolicy.ALL.contains(t)) {
+                throw new IllegalArgumentException("tiers 含非法值: " + v);
+            }
+            out.add(t);
+        }
+        return out;
+    }
+
+    private static List<String> validate(List<String> values, Set<String> allowed, String name) {        if (values == null || values.isEmpty()) {
+            return List.of();
+        }
+        List<String> out = new ArrayList<>();
+        for (String v : values) {
+            String t = v == null ? "" : v.trim().toLowerCase(Locale.ROOT);
+            if (!allowed.contains(t)) {
+                throw new IllegalArgumentException(name + " 含非法值: " + v);
+            }
+            out.add(t);
+        }
+        return out;
+    }
+
+    private static OffsetDateTime parseAsOf(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return OffsetDateTime.now(ZoneOffset.UTC);
+        }
+        try {
+            return Instant.parse(raw).atOffset(ZoneOffset.UTC);
+        } catch (Exception ignored) {
+            try {
+                return LocalDate.parse(raw).atStartOfDay().atOffset(ZoneOffset.UTC);
+            } catch (Exception e) {
+                throw new IllegalArgumentException("asOf 需为 ISO-8601 时间或日期: " + raw);
+            }
+        }
+    }
+}

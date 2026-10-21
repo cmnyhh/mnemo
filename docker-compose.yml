@@ -1,0 +1,162 @@
+# mnemo：记忆服务 + PostgreSQL 18（BM25）+ Qdrant
+#
+#   docker compose up -d            # 用预构建镜像（推荐）
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+#                                   # 从源码构建（开发用）
+#
+# 内存按「2 核 / 3.1G 可用」配的：limit 合计 2.3G，常驻约 1.7G，其余留给页缓存。
+# 不要把三个 limit 加起来等于可用内存——那样页缓存没地方待，向量查询会一直走磁盘。
+#
+# db 与 qdrant 只绑 127.0.0.1，对外只有 service 一层。生产请在前面挂 HTTPS 反代：
+# 控制台与 /v1 都靠口令和令牌挡住，不该直接暴露。
+
+# 项目名沿用历史部署：改它等于换一个栈，挂的是空卷。
+name: memory
+
+services:
+  db:
+    image: ${MNEMO_DB_IMAGE:-yejiu233/mnemo-db:18}
+    restart: unless-stopped
+    shm_size: 256mb
+    mem_limit: 768m
+    environment:
+      POSTGRES_DB: memory
+      POSTGRES_USER: memory
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 未设置，见 .env.example}
+      TZ: Asia/Shanghai
+    # shared_buffers 压到 384MB：这台机要同时跑 JVM 和 Qdrant，
+    # PG 独占缓存越少，页缓存越有空间给向量文件。
+    command:
+      - postgres
+      - -c
+      - shared_buffers=384MB
+      - -c
+      - work_mem=8MB
+      - -c
+      - maintenance_work_mem=128MB
+      - -c
+      - effective_cache_size=1536MB
+      - -c
+      - max_connections=30
+      - -c
+      - shared_preload_libraries=pg_textsearch
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - log_min_duration_statement=500
+    volumes:
+      # PG 18 起官方镜像改成「挂到 /var/lib/postgresql，数据在子目录里」，
+      # 挂 .../data 会被判成旧布局并拒绝启动（docker-library/postgres#1259）。
+      - pgdata:/var/lib/postgresql
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U memory -d memory"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    ports:
+      - "127.0.0.1:5432:5432"
+
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    restart: unless-stopped
+    mem_limit: 320m
+    environment:
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:?QDRANT_API_KEY 未设置，见 .env.example}
+      # payload 落盘；vectors 的 on_disk 是 collection 级参数，建集合时传
+      QDRANT__STORAGE__ON_DISK_PAYLOAD: "true"
+      QDRANT__TELEMETRY_DISABLED: "true"
+    volumes:
+      - qdrant:/qdrant/storage
+    ports:
+      - "127.0.0.1:6333:6333"
+      - "127.0.0.1:6334:6334"
+
+  service:
+    image: ${MNEMO_IMAGE:-yejiu233/mnemo:1.2.0}
+    restart: unless-stopped
+    mem_limit: 1280m
+    environment:
+      MEMORY_DB_URL: jdbc:postgresql://db:5432/memory
+      MEMORY_DB_USER: memory
+      MEMORY_DB_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 未设置}
+      MEMORY_QDRANT_URL: http://qdrant:6333
+      MEMORY_QDRANT_API_KEY: ${QDRANT_API_KEY:?QDRANT_API_KEY 未设置}
+      MEMORY_QDRANT_COLLECTION: memory
+      # 租户：一个部署一个租户，由服务端决定，请求体传了也不认。
+      MEMORY_TENANT: ${MEMORY_TENANT:-default}
+      # 控制台口令：只管 Web 控制台，与 API 令牌互不影响。
+      # 留空 = 控制台关闭（记忆 API 照常工作）。首次启动写入库，之后以库里为准。
+      MEMORY_ADMIN_USERNAME: ${MEMORY_ADMIN_USERNAME:-admin}
+      MEMORY_ADMIN_PASSWORD: ${MEMORY_ADMIN_PASSWORD:-}
+      MEMORY_ADMIN_SESSION_HOURS: ${MEMORY_ADMIN_SESSION_HOURS:-12}
+      MEMORY_ADMIN_COOKIE_SECURE: ${MEMORY_ADMIN_COOKIE_SECURE:-auto}
+      # hash = 本地确定性向量（无语义能力，只够冒烟）；真实召回切 http
+      MEMORY_EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-hash}
+      MEMORY_EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      MEMORY_EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-}
+      MEMORY_EMBEDDING_MODEL: ${EMBEDDING_MODEL:-qwen3-embedding-8b}
+      MEMORY_RERANK_API_KEY: ${RERANK_API_KEY:-}
+      MEMORY_RERANK_BASE_URL: ${RERANK_BASE_URL:-}
+      MEMORY_RERANK_MODEL: ${RERANK_MODEL:-}
+      # 精排：none = 按 RRF 名次。只影响排序精度，缺了也能召回。
+      MEMORY_RERANK_PROVIDER: ${RERANK_PROVIDER:-none}
+      MEMORY_RERANK_TIMEOUT_MS: ${RERANK_TIMEOUT_MS:-600}
+      MEMORY_RERANK_TOP_N: ${RERANK_TOP_N:-12}
+      MEMORY_RERANK_SKIP_GAP: ${RERANK_SKIP_GAP:-0.35}
+      # 抽取：none = 按段硬切。它决定「记什么」，是召回质量的上限。
+      MEMORY_EXTRACT_PROVIDER: ${EXTRACT_PROVIDER:-none}
+      MEMORY_EXTRACT_BASE_URL: ${EXTRACT_BASE_URL:-}
+      MEMORY_EXTRACT_API_KEY: ${EXTRACT_API_KEY:-}
+      MEMORY_EXTRACT_MODEL: ${EXTRACT_MODEL:-}
+      MEMORY_EXTRACT_TIMEOUT_MS: ${EXTRACT_TIMEOUT_MS:-20000}
+      MEMORY_EXTRACT_MAX_ITEMS: ${EXTRACT_MAX_ITEMS:-8}
+      MEMORY_EXTRACT_MIN_CONFIDENCE: ${MEMORY_EXTRACT_MIN_CONFIDENCE:-0.35}
+      # 维度在建集合前定死，改它要全量重算 embedding
+      MEMORY_EMBEDDING_DIMS: ${EMBEDDING_DIMS:-4096}
+      # 向量最低分：低于它不进融合。RRF 只看名次，没有这道门槛时噪声也能拿高分。
+      MEMORY_DENSE_MIN_SCORE: ${DENSE_MIN_SCORE:-0.25}
+      # 分层策略。改这些值会改变「哪条记忆被注入」，不涉及模型与索引。
+      MEMORY_TIER_WORKING_SET_TTL_HOURS: ${TIER_WORKING_SET_TTL_HOURS:-24}
+      MEMORY_TIER_ARCHIVE_AFTER_DAYS: ${TIER_ARCHIVE_AFTER_DAYS:-180}
+      MEMORY_TIER_PROMOTE_ACCESS: ${TIER_PROMOTE_ACCESS:-2}
+      MEMORY_TIER_PINNED_BUDGET: ${TIER_PINNED_BUDGET:-900}
+      # 多模态附件。文件落在 assets 卷上，路径与容器内一致即可。
+      MEMORY_ASSETS_DIR: /data/assets
+      MEMORY_ASSET_MAX_BYTES: ${ASSET_MAX_BYTES:-20971520}
+      # 看图模型：none = 只存图不生成图注（上传仍可用）
+      MEMORY_VISION_PROVIDER: ${VISION_PROVIDER:-none}
+      MEMORY_VISION_BASE_URL: ${VISION_BASE_URL:-}
+      MEMORY_VISION_API_KEY: ${VISION_API_KEY:-}
+      MEMORY_VISION_MODEL: ${VISION_MODEL:-}
+      MEMORY_VISION_TIMEOUT_MS: ${VISION_TIMEOUT_MS:-30000}
+      # 行级安全：业务面以受限角色执行；关掉只失去数据库侧兜底
+      MEMORY_RLS_ENABLED: ${RLS_ENABLED:-true}
+      MEMORY_RLS_ROLE: ${RLS_ROLE:-memory_app}
+      TZ: Asia/Shanghai
+    depends_on:
+      db:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    volumes:
+      # 附件本体。独立卷而不是 bind mount：容器重建不该把图删掉，
+      # 也不该受宿主机目录权限影响（容器里是非 root 用户）。
+      - assets:/data/assets
+    ports:
+      # 反代通常跑在另一个容器或另一台机器上，绑回环它就连不上，所以这里开在 0.0.0.0。
+      # 前面没有 HTTPS 反代时，请自己改成 "127.0.0.1:8090:8080"。
+      - "${MNEMO_PORT:-8090}:8080"
+    healthcheck:
+      # 存活看 /v1/memory/health（只报自己活着），就绪看 /readyz（查依赖）
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/v1/memory/health >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  pgdata:
+  qdrant:
+  assets:

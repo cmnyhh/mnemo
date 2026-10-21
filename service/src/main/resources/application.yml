@@ -1,0 +1,162 @@
+server:
+  port: 8080
+  shutdown: graceful
+  tomcat:
+    threads:
+      max: 32
+      min-spare: 4
+
+spring:
+  application:
+    name: memory-service
+  lifecycle:
+    timeout-per-shutdown-phase: 15s
+  datasource:
+    url: ${MEMORY_DB_URL:jdbc:postgresql://127.0.0.1:5432/memory}
+    username: ${MEMORY_DB_USER:memory}
+    password: ${MEMORY_DB_PASSWORD:memory}
+    hikari:
+      # 单用户场景：8 条够用，再多只会让 PG 多分配 work_mem
+      maximum-pool-size: 8
+      minimum-idle: 2
+      connection-timeout: 3000
+      validation-timeout: 2000
+      max-lifetime: 1800000
+  jackson:
+    default-property-inclusion: non_null
+
+memory:
+  api:
+    # 租户标识：数据库令牌未绑定租户时用它兜底；令牌自带租户时以令牌为准。
+    tenant: ${MEMORY_TENANT:default}
+  # 控制台（/）自己的鉴权。口令留空 = 控制台关闭，记忆 API 不受影响。
+  # 首次启动时把 MEMORY_ADMIN_PASSWORD 写进库（只存 PBKDF2 哈希），之后改密码走界面。
+  admin:
+    # 首次启动用于初始化账号；建好之后以库里为准，改账号走控制台
+    username: ${MEMORY_ADMIN_USERNAME:admin}
+    password: ${MEMORY_ADMIN_PASSWORD:}
+    session-hours: ${MEMORY_ADMIN_SESSION_HOURS:12}
+    # auto：按请求判断（含 X-Forwarded-Proto）。走 HTTPS 反代时会自动加 Secure。
+    cookie-secure: ${MEMORY_ADMIN_COOKIE_SECURE:auto}
+  qdrant:
+    url: ${MEMORY_QDRANT_URL:http://127.0.0.1:6333}
+    api-key: ${MEMORY_QDRANT_API_KEY:}
+    collection: ${MEMORY_QDRANT_COLLECTION:memory}
+    timeout-ms: ${MEMORY_QDRANT_TIMEOUT_MS:3000}
+    # wait=true 是写后立即可查（单用户场景值得那 3~5 倍写延迟）
+    wait: ${MEMORY_QDRANT_WAIT:true}
+  embedding:
+    # hash = 本地确定性向量，只为把链路跑通；真实语义召回必须切 http
+    provider: ${MEMORY_EMBEDDING_PROVIDER:hash}
+    base-url: ${MEMORY_EMBEDDING_BASE_URL:}
+    api-key: ${MEMORY_EMBEDDING_API_KEY:}
+    model: ${MEMORY_EMBEDDING_MODEL:qwen3-embedding-8b}
+    dims: ${MEMORY_EMBEDDING_DIMS:4096}
+    timeout-ms: ${MEMORY_EMBEDDING_TIMEOUT_MS:3000}
+  search:
+    bm25-top-k: ${MEMORY_BM25_TOP_K:40}
+    dense-top-k: ${MEMORY_DENSE_TOP_K:40}
+    rrf-k: ${MEMORY_RRF_K:60}
+    default-top-k: ${MEMORY_DEFAULT_TOP_K:6}
+    max-top-k: ${MEMORY_MAX_TOP_K:50}
+    # top1 归一化分低于这个值就弃权（宁可不注入，也不注错）
+    abstain-threshold: ${MEMORY_ABSTAIN_THRESHOLD:0.35}
+    # 注入预算：1200 token ≈ 1200 汉字，按字符数保守控制
+    injection-budget-chars: ${MEMORY_INJECTION_BUDGET:1200}
+    # 向量路的绝对相似度门槛。RRF 只看名次不看分数，没有这道门槛时
+    # 一条毫不相关的向量也会被排成第 1 名（hash 向量尤其明显）。
+    dense-min-score: ${MEMORY_DENSE_MIN_SCORE:0.25}
+  # 精排（cross-encoder）。none = 不精排，等价于历史行为（按 RRF 名次输出）。
+  # 精排是「排序精度」手段，不是召回的必要条件；它在融合之后、截断之前介入。
+  rerank:
+    provider: ${MEMORY_RERANK_PROVIDER:none}
+    base-url: ${MEMORY_RERANK_BASE_URL:}
+    api-key: ${MEMORY_RERANK_API_KEY:}
+    model: ${MEMORY_RERANK_MODEL:}
+    # 硬预算：超时立刻放弃本轮精排，退回 RRF 顺序（设计稿 350ms，跨境端点留余量）
+    timeout-ms: ${MEMORY_RERANK_TIMEOUT_MS:600}
+    # 只精排可能进注入的那一批，没必要对 40 条都跑一遍
+    top-n: ${MEMORY_RERANK_TOP_N:12}
+    # 第一名已明显领先（RRF 归一化分差 > 此值）就跳过精排，省一次调用
+    skip-gap: ${MEMORY_RERANK_SKIP_GAP:0.35}
+
+  # 写入抽取。none = 按段硬切（0.5.0 的行为），抽取器未配置时就是这个降级路径。
+  # 抽取决定「记什么」，是召回质量的上限：写漏了的记忆，后面怎么调参都救不回来。
+  extract:
+    provider: ${MEMORY_EXTRACT_PROVIDER:none}
+    base-url: ${MEMORY_EXTRACT_BASE_URL:}
+    api-key: ${MEMORY_EXTRACT_API_KEY:}
+    model: ${MEMORY_EXTRACT_MODEL:}
+    # 抽取在写入路径上，可以慢；但要有上限，避免一轮对话卡住整批写入
+    timeout-ms: ${MEMORY_EXTRACT_TIMEOUT_MS:20000}
+    # 单次最多产出几条。宁可多抽，低置信度的由 min-confidence 与 trust 在下游过滤
+    max-items: ${MEMORY_EXTRACT_MAX_ITEMS:8}
+    min-confidence: ${MEMORY_EXTRACT_MIN_CONFIDENCE:0.35}
+
+  # 记忆分层。四层的职责见 README「分层」一节：
+  # T0 常驻（显式钉住）/ T1 会话工作集 / T2 长期 / T3 归档。
+  # 这些是部署级策略：调它不改模型、不重建索引，但会改变注入结果。
+  tier:
+    # 会话静默超过这么久，它的工作集就降回 T2。按「会话」而不是「单条」判断，
+    # 因为一轮对话里的多条 episode 应该一起进出工作集。
+    working-set-ttl-hours: ${MEMORY_TIER_WORKING_SET_TTL_HOURS:24}
+    # 这么久没被访问、且没被引用过的低重要度记录进归档层（不再参与默认召回）
+    archive-after-days: ${MEMORY_TIER_ARCHIVE_AFTER_DAYS:180}
+    # 同一会话内被重复命中的 T2 记录升进工作集的门槛
+    promote-access: ${MEMORY_TIER_PROMOTE_ACCESS:2}
+    # 常驻记忆单独一份预算：它每轮都注入，不能挤占检索注入的那 1200 字符
+    pinned-budget-chars: ${MEMORY_TIER_PINNED_BUDGET:900}
+
+  # 多模态附件。图片/音频/文档落在本地卷上，PG 只存元数据与 sha256。
+  # 放本地而不是对象存储：单机部署，多一个外部依赖只会多一个故障点。
+  assets:
+    dir: ${MEMORY_ASSETS_DIR:/data/assets}
+    max-bytes: ${MEMORY_ASSET_MAX_BYTES:20971520}
+
+  # 看图模型（VLM）。none = 不做图注，只存原图 + 调用方给的说明。
+  vision:
+    provider: ${MEMORY_VISION_PROVIDER:none}
+    base-url: ${MEMORY_VISION_BASE_URL:}
+    api-key: ${MEMORY_VISION_API_KEY:}
+    model: ${MEMORY_VISION_MODEL:}
+    timeout-ms: ${MEMORY_VISION_TIMEOUT_MS:30000}
+  # 行级安全（纵深防御）。业务请求声明租户后以受限角色执行，
+  # 忘写 tenant_id 时数据库返回空集而不是别人的行。
+  rls:
+    enabled: ${MEMORY_RLS_ENABLED:true}
+    role: ${MEMORY_RLS_ROLE:memory_app}
+
+# 观测端点。刻意只开两个，且挂在 /internal 下：
+#   * 端点在同一个端口，所以仍然先过 ApiTokenFilter —— 抓取要带 Bearer 令牌。
+#     单开管理端口的话就必须再写一套鉴权，多一条会漏的路。
+#   * 只暴露 prometheus 与 health：env / beans / heapdump 这类端点对外等于给攻击者
+#     递上一份内部结构图，也没有任何运维场景需要它们。
+management:
+  endpoints:
+    web:
+      base-path: /internal
+      path-mapping:
+        prometheus: metrics
+      exposure:
+        include: prometheus,health
+  endpoint:
+    health:
+      show-details: never
+  metrics:
+    tags:
+      application: mnemo
+    distribution:
+      # 计时器自己已经声明了 p50/p95/p99（见 MetricsRecorder）；这里开直方图是为了
+      # 让 Prometheus 侧还能用 histogram_quantile 算别的分位，也给跨实例聚合留余地。
+      percentiles:
+        mnemo.search: 0.5,0.95,0.99
+        mnemo.ingest: 0.5,0.95,0.99
+      percentiles-histogram:
+        mnemo.search: true
+        mnemo.ingest: true
+
+logging:
+  level:
+    root: INFO
+    com.hs.memory: ${MEMORY_LOG_LEVEL:INFO}
+    org.springframework.jdbc.core: WARN

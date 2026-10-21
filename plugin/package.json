@@ -1,0 +1,79 @@
+{
+  "name": "mnemo-memory-core",
+  "version": "1.0.0",
+  "description": "mnemo 的 dsh 插件：每轮对话自动落库，下一轮按需召回，并暴露 memory_search 工具。",
+  "license": "MIT",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "smoke.mjs",
+    "README.md"
+  ],
+  "keywords": [
+    "mnemo",
+    "memory",
+    "long-term-memory",
+    "agent-memory",
+    "dsh-plugin"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cmnyhh/mnemo.git",
+    "directory": "plugin"
+  },
+  "homepage": "https://github.com/cmnyhh/mnemo/tree/main/plugin",
+  "bugs": {
+    "url": "https://github.com/cmnyhh/mnemo/issues"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "smoke": "node smoke.mjs",
+    "prepublishOnly": "node build.mjs"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "3.18.5-alpha.1"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.1"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^0.2.1-alpha.1",
+    "@deepseek-ai/dsh-agent": "^0.2.1-alpha.1",
+    "@deepseek-ai/dsh-llm": "^0.2.1-alpha.1",
+    "@deepseek-ai/dsh-session": "^0.2.1-alpha.1",
+    "@deepseek-ai/dsh-tools": "^0.2.1-alpha.1"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-agent": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-llm": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-session": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    }
+  }
+}

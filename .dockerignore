@@ -1,0 +1,11 @@
+console/node_modules
+console/dist
+service/target
+plugin
+docs
+tools
+.git
+.github
+.env
+*.log
+.DS_Store
