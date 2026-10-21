@@ -40,6 +40,20 @@ DIA = re.compile(r"\[(D\d+:\d+)\]")
 
 _LOCAL = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
 
+_TOKENS: dict[str, str] = {}
+
+
+def load_tokens(path: str) -> None:
+    """LoCoMo 每段对话是一个独立记忆库——通行做法，也是唯一能避免跨对话串味的方式。
+    令牌按 sample 映射，一个 sample 一个租户。"""
+    global _TOKENS
+    if path and Path(path).exists():
+        _TOKENS = json.loads(Path(path).read_text())
+
+
+def token_for(sample: str, fallback: str) -> str:
+    return _TOKENS.get(sample, fallback)
+
 
 def _opener(url: str):
     """本机地址绕开环境代理。urllib 会读 HTTP_PROXY，而经 SSH 隧道暴露的服务
@@ -118,14 +132,14 @@ def do_ingest(args) -> None:
                     "kind": "episode",
                     "narrative": session_text(num, date, turns),
                     "importance": 0.5,
-                    "trustLevel": "manual",
+                    "trustLevel": "high",
                 }],
                 "idempotencyKey": f"locomo:{sample}:{num}",
             }
             try:
-                resp = http_json(args.base + "/v1/memory/ingest", body, args.token)
+                resp = http_json(args.base + "/v1/memory/ingest", body, token_for(sample, args.token))
                 done += 1
-                ids = resp.get("ids") or []
+                ids = resp.get("ids") or [i.get("id") for i in (resp.get("items") or [])]
                 if not ids:
                     print(f"  !! {sample} s{num}: 没有返回 id {resp}", file=sys.stderr)
             except Exception as e:  # 单条失败不该毁掉整轮
@@ -159,7 +173,7 @@ def do_ask(args) -> None:
         try:
             resp = http_json(args.base + "/v1/memory/search",
                              {"query": q["question"], "topK": args.topk},
-                             args.token)
+                             token_for(q["sample"], args.token))
         except Exception as e:
             return {**q, "error": str(e), "hits": 0}
         hits = resp.get("hits") or []
@@ -206,30 +220,60 @@ ANSWER_SYSTEM = (
 )
 
 JUDGE_SYSTEM = (
-    "You grade an answer against a reference answer. "
-    "Reply with one word: CORRECT or WRONG. "
-    "A short paraphrase that carries the same fact counts as CORRECT. "
-    "A date is CORRECT if it names the same day, even in another format. "
-    "If the reference says the answer is absent from the conversation, then "
-    "an answer that declines counts as CORRECT."
+    "You are grading whether a candidate answer conveys the same fact as the reference answer.\n"
+    "Say CORRECT if a reader would take away the same fact (paraphrase, abbreviation, or "
+    "equivalent date format all count).\n"
+    "Say WRONG if the candidate states a different fact, is vague, or declines while the "
+    "reference has an answer.\n"
+    "Reply with one word: CORRECT or WRONG."
+)
+
+# 第 5 类（adversarial）的题面预设了一件从未发生的事，标准答案字段只有陷阱答案。
+# 判的是「有没有被诱导」，所以拒答才算对。措辞比 exact match 宽一点，
+# 否则「The excerpts don't mention it」这种完全正确的回答会被判错。
+DECLINE = re.compile(
+    r"not mentioned|no mention|no information|not specified|not stated|no record|"
+    r"(?:don'?t|doesn'?t|didn'?t) (?:mention|have|know|contain|include|say|provid)|"
+    r"not (?:in|present in) the|never (?:mentioned|happened|occurred)|"
+    r"unknown|cannot (?:be )?(?:determined|answer)|not enough (?:information|context)|"
+    r"does not (?:appear|say|mention)|did not (?:happen|say|mention)",
+    re.I,
 )
 
 
-def llm(args, system: str, user: str) -> str:
+def is_decline(answer: str) -> bool:
+    return bool(DECLINE.search(answer or "")) or (answer or "").strip().upper() == "NOT MENTIONED"
+
+
+def verdict_of(raw: str) -> str:
+    """判分模型的回复可能带解释，只取第一个判定词。"""
+    hit = re.search(r"\b(CORRECT|INCORRECT|WRONG)\b", (raw or "").upper())
+    if not hit:
+        return "WRONG"
+    return "CORRECT" if hit.group(1) == "CORRECT" else "WRONG"
+
+
+def llm(args, system: str, user: str, model: str | None = None) -> str:
     body = {
-        "model": args.model,
+        "model": model or args.model,
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
         "temperature": 0,
         "max_tokens": 120,
     }
-    for attempt in range(3):
+    # 429 是配额问题，重试要退避得足够久才有意义；退完了还不行就显式报错，
+    # 绝不能默认当「答错」——那会把限流计成模型的错，指标就假了。
+    for attempt in range(5):
         try:
             resp = http_json(args.llm_base.rstrip("/") + "/chat/completions", body, args.llm_key, timeout=180)
             return (resp["choices"][0]["message"]["content"] or "").strip()
+        except urllib.error.HTTPError as e:
+            if attempt == 4:
+                return f"__ERR__ HTTP {e.code}"
+            time.sleep(min(30, 3 * (2 ** attempt)))
         except (urllib.error.URLError, KeyError, TimeoutError, json.JSONDecodeError) as e:
-            if attempt == 2:
+            if attempt == 4:
                 return f"__ERR__ {e}"
-            time.sleep(1.5 * (attempt + 1))
+            time.sleep(2 * (attempt + 1))
     return "__ERR__"
 
 
@@ -250,33 +294,37 @@ def do_judge(args) -> None:
         prompt = (f"MEMORY EXCERPTS:\n{ctx or '(nothing retrieved)'}\n\n"
                   f"QUESTION: {r['question']}\nAnswer:")
         answer = llm(args, ANSWER_SYSTEM, prompt)
+        if answer.startswith("__ERR__"):
+            return {**r, "gold": r.get("answer"), "answer": answer, "verdict": "ERROR",
+                    "correct": None, "adversarial": r["category"] == 5}
 
         gold = r["answer"]
-        # 类别 5 是「这段对话里根本没这回事」，标准答案是一个看起来很像的错答案。
-        # 这类题判的是「有没有被诱导」，所以拒答才算对。
         adversarial = r["category"] == 5
         if adversarial:
-            correct = answer.upper().startswith("NOT MENTIONED")
+            correct = is_decline(answer)
             verdict = "CORRECT" if correct else "WRONG"
         else:
-            verdict_raw = llm(args, JUDGE_SYSTEM,
-                              f"REFERENCE: {gold}\nCANDIDATE: {answer}\nVerdict:")
-            verdict = "CORRECT" if "CORRECT" in verdict_raw.upper().replace("INCORRECT", "") else "WRONG"
+            raw = llm(args, JUDGE_SYSTEM,
+                      f"QUESTION: {r['question']}\nREFERENCE: {gold}\nCANDIDATE: {answer}\nVerdict:",
+                      model=args.judge_model or args.model)
+            if raw.startswith("__ERR__"):
+                return {**r, "gold": gold, "answer": answer, "verdict": "ERROR",
+                        "correct": None, "adversarial": False}
+            verdict = verdict_of(raw)
             correct = verdict == "CORRECT"
-        return {**r, "answer": answer, "verdict": verdict, "correct": correct,
-                "adversarial": adversarial}
+        return {**r, "gold": gold, "answer": answer, "verdict": verdict,
+                "correct": correct, "adversarial": adversarial}
 
     results = []
-    with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
+    # 边跑边落盘：判分这一步要二十多分钟，中途断了不该从零开始
+    with out.open("a") as fh, ThreadPoolExecutor(max_workers=args.concurrency) as pool:
         futures = [pool.submit(one, r) for r in todo]
         for i, fut in enumerate(as_completed(futures), 1):
-            results.append(fut.result())
+            row = fut.result()
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+            fh.flush()
             if i % 25 == 0 or i == len(todo):
                 print(f"  {i}/{len(todo)}  {i / max(1e-6, time.time() - t0):.1f} q/s", flush=True)
-
-    with out.open("a") as fh:
-        for row in results:
-            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
     print(f"wrote {out}")
 
 
@@ -293,15 +341,17 @@ def do_report(args) -> None:
     cats: dict[int, dict[str, list[float]]] = {}
     for qid, r in ask_rows.items():
         c = r["category"]
-        bucket = cats.setdefault(c, {"recall_any": [], "recall_all": [], "acc": [], "lat": []})
+        bucket = cats.setdefault(c, {"recall_any": [], "recall_all": [], "acc": [], "lat": [], "err": []})
         found, total = len(r.get("evidenceFound") or []), r.get("evidenceTotal") or 0
         bucket["recall_any"].append(1.0 if found > 0 else 0.0)
         bucket["recall_all"].append(1.0 if total and found >= total else 0.0)
         if r.get("elapsedMs"):
             bucket["lat"].append(float(r["elapsedMs"]))
         j = judge_rows.get(qid)
-        if j is not None:
+        if j is not None and j.get("correct") is not None:
             bucket["acc"].append(1.0 if j.get("correct") else 0.0)
+        if j is not None and j.get("verdict") == "ERROR":
+            bucket["err"].append(1.0)
 
     def mean(xs):
         return sum(xs) / len(xs) if xs else float("nan")
@@ -309,9 +359,9 @@ def do_report(args) -> None:
     def pct(x):
         return "—" if x != x else f"{x * 100:.1f}%"
 
-    lines = ["| 类别 | 题数 | 证据召回(任意) | 证据召回(全部) | 准确率 | 检索 p50 |",
-             "| --- | ---: | ---: | ---: | ---: | ---: |"]
-    all_bucket = {"recall_any": [], "recall_all": [], "acc": [], "lat": []}
+    lines = ["| 类别 | 题数 | 证据召回(任意) | 证据召回(全部) | 准确率 | 检索 p50 | 判分失败 |",
+             "| --- | ---: | ---: | ---: | ---: | ---: | ---: |"]
+    all_bucket = {"recall_any": [], "recall_all": [], "acc": [], "lat": [], "err": []}
     for c in sorted(cats):
         b = cats[c]
         for k in all_bucket:
@@ -320,13 +370,13 @@ def do_report(args) -> None:
         p50 = f"{lat[len(lat) // 2]:.0f} ms" if lat else "—"
         lines.append(f"| {c} {CATEGORY_NAMES.get(c, '')} | {len(b['recall_any'])} | "
                      f"{pct(mean(b['recall_any']))} | {pct(mean(b['recall_all']))} | "
-                     f"{pct(mean(b['acc']))} | {p50} |")
+                     f"{pct(mean(b['acc']))} | {p50} | {len(b['err'])} |")
     lat = sorted(all_bucket["lat"])
     p50 = f"{lat[len(lat) // 2]:.0f} ms" if lat else "—"
     lines.append(f"| **合计** | {len(all_bucket['recall_any'])} | "
                  f"**{pct(mean(all_bucket['recall_any']))}** | "
                  f"**{pct(mean(all_bucket['recall_all']))}** | "
-                 f"**{pct(mean(all_bucket['acc']))}** | {p50} |")
+                 f"**{pct(mean(all_bucket['acc']))}** | {p50} | {len(all_bucket['err'])} |")
 
     table = "\n".join(lines)
     print(table)
@@ -341,6 +391,7 @@ def main() -> None:
     p.add_argument("--data", default="/tmp/locomo10.json")
     p.add_argument("--base", default=os.environ.get("MNEMO_BASE", "http://127.0.0.1:8090"))
     p.add_argument("--token", default=os.environ.get("MNEMO_TOKEN", ""))
+    p.add_argument("--tokens", default=os.environ.get("MNEMO_TOKENS_FILE", ""))
     p.add_argument("--out", default="bench/locomo/out/ask.jsonl")
     p.add_argument("--table-out", default="")
     p.add_argument("--topk", type=int, default=12)
@@ -350,7 +401,9 @@ def main() -> None:
     p.add_argument("--llm-base", default=os.environ.get("BENCH_LLM_BASE", ""))
     p.add_argument("--llm-key", default=os.environ.get("BENCH_LLM_KEY", ""))
     p.add_argument("--model", default=os.environ.get("BENCH_LLM_MODEL", ""))
+    p.add_argument("--judge-model", default=os.environ.get("BENCH_JUDGE_MODEL", ""))
     args = p.parse_args()
+    load_tokens(args.tokens)
 
     {"ingest": do_ingest, "ask": do_ask, "judge": do_judge, "report": do_report}[args.stage](args)
 
