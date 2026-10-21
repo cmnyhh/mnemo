@@ -18,3 +18,6 @@ plugin/index.js
 *.iml
 .vscode/
 node_modules/
+
+# 评测产物
+bench/locomo/out/
