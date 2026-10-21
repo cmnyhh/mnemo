@@ -19,6 +19,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -118,35 +119,59 @@ def load_questions(path: Path) -> list[dict]:
 
 # ---------------------------------------------------------------- ingest
 
+def turn_text(num: int, date: str, turn: dict) -> str:
+    """一轮一条记忆。产品里写入的就是这种原子粒度，注入块每条最多渲染 220 字，
+    整段会话当一条写进去，答案多半落在截断之后——那是评测方法的问题，不是系统的。"""
+    caption = turn.get("blip_caption")
+    text = turn.get("text", "")
+    if caption:
+        text = f"{text} [shares a photo: {caption}]"
+    when = f"On {date}" if date else f"In session {num}"
+    return f"{when}, [{turn.get('dia_id', '')}] {turn.get('speaker', '?')}: {text}"
+
+
 def do_ingest(args) -> None:
     data = json.loads(Path(args.data).read_text())
-    total = sum(len(sessions_of(c["conversation"])) for c in data)
-    done = 0
+    units = []
     for conv in data:
         sample = conv["sample_id"]
         for num, date, turns in sessions_of(conv["conversation"]):
-            body = {
-                "sessionId": f"locomo-{sample}-s{num}",
-                "projectId": f"locomo-{sample}",
-                "items": [{
-                    "kind": "episode",
-                    "narrative": session_text(num, date, turns),
-                    "importance": 0.5,
-                    "trustLevel": "high",
-                }],
-                "idempotencyKey": f"locomo:{sample}:{num}",
-            }
-            try:
-                resp = http_json(args.base + "/v1/memory/ingest", body, token_for(sample, args.token))
-                done += 1
-                ids = resp.get("ids") or [i.get("id") for i in (resp.get("items") or [])]
-                if not ids:
-                    print(f"  !! {sample} s{num}: 没有返回 id {resp}", file=sys.stderr)
-            except Exception as e:  # 单条失败不该毁掉整轮
-                print(f"  !! {sample} s{num}: {e}", file=sys.stderr)
-            if done % 25 == 0:
-                print(f"  ingested {done}/{total}", flush=True)
-    print(f"ingested {done}/{total}")
+            if args.granularity == "session":
+                units.append((sample, f"{sample}:s{num}", session_text(num, date, turns)))
+            else:
+                for turn in turns:
+                    dia = turn.get("dia_id") or f"s{num}-{len(units)}"
+                    units.append((sample, f"{sample}:{dia}", turn_text(num, date, turn)))
+    total = len(units)
+    print(f"ingest: {total} 条（粒度 {args.granularity}）", flush=True)
+    done = [0]
+    lock = threading.Lock()
+
+    def one(unit):
+        sample, key, narrative = unit
+        body = {
+            "sessionId": key.split(":")[1] if ":" in key else key,
+            "projectId": f"locomo-{sample}",
+            "items": [{"kind": "episode", "narrative": narrative,
+                       "importance": 0.5, "trustLevel": "high"}],
+            "idempotencyKey": f"locomo:{key}",
+        }
+        try:
+            resp = http_json(args.base + "/v1/memory/ingest", body, token_for(sample, args.token))
+            ok = bool(resp.get("ids") or resp.get("items"))
+            note = "" if ok else str(resp)[:120]
+        except Exception as e:
+            ok, note = False, str(e)[:120]
+        with lock:
+            done[0] += 1
+            if not ok:
+                print(f"  !! {key}: {note}", file=sys.stderr)
+            if done[0] % 250 == 0:
+                print(f"  ingested {done[0]}/{total}", flush=True)
+
+    with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
+        list(pool.map(one, units))
+    print(f"ingested {done[0]}/{total}")
 
 
 # ---------------------------------------------------------------- ask
@@ -192,7 +217,7 @@ def do_ask(args) -> None:
             # 逐 dia_id 对账：证据是否真的出现在召回文本里
             "evidenceFound": sorted(set(q["evidence"]) & gathered),
             "evidenceTotal": len(q["evidence"]),
-            "retrieved": sorted(gathered)[:80],
+            "retrieved": sorted(gathered, key=lambda d: (int(d.split(":")[0][1:]), int(d.split(":")[1]))),
             "wallMs": int((time.time() - started) * 1000),
         }
 
@@ -253,12 +278,14 @@ def verdict_of(raw: str) -> str:
     return "CORRECT" if hit.group(1) == "CORRECT" else "WRONG"
 
 
-def llm(args, system: str, user: str, model: str | None = None) -> str:
+def llm(args, system: str, user: str, model: str | None = None, max_tokens: int = 600) -> str:
+    # 推理型模型会先花 token 思考再吐正文；给 120 这种小额度，正文直接是空的。
+    # 这不是「答不出」，是预算给错了——所以默认留足。
     body = {
         "model": model or args.model,
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
         "temperature": 0,
-        "max_tokens": 120,
+        "max_tokens": max_tokens,
     }
     # 429 是配额问题，重试要退避得足够久才有意义；退完了还不行就显式报错，
     # 绝不能默认当「答错」——那会把限流计成模型的错，指标就假了。
@@ -293,7 +320,7 @@ def do_judge(args) -> None:
         ctx = r.get("context") or ""
         prompt = (f"MEMORY EXCERPTS:\n{ctx or '(nothing retrieved)'}\n\n"
                   f"QUESTION: {r['question']}\nAnswer:")
-        answer = llm(args, ANSWER_SYSTEM, prompt)
+        answer = llm(args, ANSWER_SYSTEM, prompt, max_tokens=700)
         if answer.startswith("__ERR__"):
             return {**r, "gold": r.get("answer"), "answer": answer, "verdict": "ERROR",
                     "correct": None, "adversarial": r["category"] == 5}
@@ -306,7 +333,7 @@ def do_judge(args) -> None:
         else:
             raw = llm(args, JUDGE_SYSTEM,
                       f"QUESTION: {r['question']}\nREFERENCE: {gold}\nCANDIDATE: {answer}\nVerdict:",
-                      model=args.judge_model or args.model)
+                      model=args.judge_model or args.model, max_tokens=400)
             if raw.startswith("__ERR__"):
                 return {**r, "gold": gold, "answer": answer, "verdict": "ERROR",
                         "correct": None, "adversarial": False}
@@ -342,9 +369,14 @@ def do_report(args) -> None:
     for qid, r in ask_rows.items():
         c = r["category"]
         bucket = cats.setdefault(c, {"recall_any": [], "recall_all": [], "acc": [], "lat": [], "err": []})
-        found, total = len(r.get("evidenceFound") or []), r.get("evidenceTotal") or 0
-        bucket["recall_any"].append(1.0 if found > 0 else 0.0)
-        bucket["recall_all"].append(1.0 if total and found >= total else 0.0)
+        # 证据字段里存在 "D8:6; D9:17" 这种一条塞多个的，得先拆开；
+        # 少数 open-domain 题本身没标证据，不能算作漏召，直接排除出分母。
+        ev = [p.strip() for e in (r.get("evidence") or []) for p in e.split(";") if p.strip()]
+        if ev:
+            got = set(r.get("retrieved") or [])
+            found = len([x for x in ev if x in got])
+            bucket["recall_any"].append(1.0 if found > 0 else 0.0)
+            bucket["recall_all"].append(1.0 if found == len(ev) else 0.0)
         if r.get("elapsedMs"):
             bucket["lat"].append(float(r["elapsedMs"]))
         j = judge_rows.get(qid)
@@ -398,6 +430,7 @@ def main() -> None:
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--concurrency", type=int, default=6)
     p.add_argument("--max-context", type=int, default=6000)
+    p.add_argument("--granularity", choices=["turn", "session"], default="turn")
     p.add_argument("--llm-base", default=os.environ.get("BENCH_LLM_BASE", ""))
     p.add_argument("--llm-key", default=os.environ.get("BENCH_LLM_KEY", ""))
     p.add_argument("--model", default=os.environ.get("BENCH_LLM_MODEL", ""))
