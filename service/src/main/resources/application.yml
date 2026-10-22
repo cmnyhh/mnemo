@@ -73,8 +73,10 @@ memory:
     base-url: ${MEMORY_RERANK_BASE_URL:}
     api-key: ${MEMORY_RERANK_API_KEY:}
     model: ${MEMORY_RERANK_MODEL:}
-    # 硬预算：超时立刻放弃本轮精排，退回 RRF 顺序（设计稿 350ms，跨境端点留余量）
-    timeout-ms: ${MEMORY_RERANK_TIMEOUT_MS:600}
+    # 硬预算：超时放弃本次尝试（会再重试一次），两次都失败才退回 RRF 顺序。
+    # 别设回 600~800ms —— 实测公网 p50 约 210ms、p90 约 250ms，800ms 的余量太小，
+    # 一次网络抖动就会静默降级，而用户只会看到「这轮回答变差了」。
+    timeout-ms: ${MEMORY_RERANK_TIMEOUT_MS:2000}
     # 只精排可能进注入的那一批，没必要对 40 条都跑一遍
     top-n: ${MEMORY_RERANK_TOP_N:12}
     # 第一名已明显领先（RRF 归一化分差 > 此值）就跳过精排，省一次调用

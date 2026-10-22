@@ -2,10 +2,13 @@ package com.hs.memory.rerank;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.hs.memory.net.Retry;
+import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.net.http.HttpTimeoutException;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -19,6 +22,9 @@ import java.util.Map;
  * 有的实现不返回 index、只按顺序给——那种情况按数组顺序对回去。
  *
  * <p>超时按硬预算处理：宁可这一轮不精排，也不能让召回整体超时。
+ *
+ * <p>失败只在「值得重试」时重试一次（429 / 408 / 5xx / 连接超时）。公网端点的抖动大多是这一类，
+ * 一次重试能把「静默退回 RRF」的比例压下去；参数或鉴权错则直接失败，不浪费时间。
  */
 public class HttpReranker implements Reranker {
 
@@ -48,6 +54,22 @@ public class HttpReranker implements Reranker {
         }
         int n = Math.min(docs.size(), maxDocs);
         List<String> batch = docs.subList(0, n);
+        RerankException last = null;
+        for (int attempt = 1; attempt <= Retry.ATTEMPTS; attempt++) {
+            try {
+                return scoreOnce(query, batch, n);
+            } catch (RerankException e) {
+                last = e;
+                if (!e.retryable() || attempt == Retry.ATTEMPTS) {
+                    throw e;
+                }
+                Retry.backoff();
+            }
+        }
+        throw last;
+    }
+
+    private double[] scoreOnce(String query, List<String> batch, int n) throws RerankException {
         try {
             Map<String, Object> body = new LinkedHashMap<>();
             body.put("model", model);
@@ -66,7 +88,9 @@ public class HttpReranker implements Reranker {
 
             HttpResponse<String> resp = http.send(req.build(), HttpResponse.BodyHandlers.ofString());
             if (resp.statusCode() / 100 != 2) {
-                throw new RerankException("rerank HTTP " + resp.statusCode() + ": " + abbreviate(resp.body()));
+                throw new RerankException(
+                        "rerank HTTP " + resp.statusCode() + ": " + abbreviate(resp.body()),
+                        Retry.retryableStatus(resp.statusCode()));
             }
             return parse(resp.body(), n);
         } catch (RerankException e) {
@@ -74,6 +98,11 @@ public class HttpReranker implements Reranker {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new RerankException("rerank 被中断", e);
+        } catch (HttpTimeoutException e) {
+            // 「超时」要跟「对端 500」一样对待：这一轮可能是端点抖动，重试一次往往就好了。
+            throw new RerankException("rerank 超时（" + timeout.toMillis() + "ms）", e, true);
+        } catch (IOException e) {
+            throw new RerankException("rerank 调用失败: " + e.getMessage(), e, true);
         } catch (Exception e) {
             throw new RerankException("rerank 调用失败: " + e.getMessage(), e);
         }
