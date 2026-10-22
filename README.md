@@ -8,7 +8,7 @@
 
 <p align="center">
   <a href="https://hub.docker.com/r/yejiu233/mnemo"><img src="https://img.shields.io/docker/pulls/yejiu233/mnemo?label=docker%20pulls" alt="Docker pulls"></a>
-  <a href="https://www.npmjs.com/package/mnemo-memory-core"><img src="https://img.shields.io/npm/v/mnemo-memory-core" alt="npm"></a>
+  <a href="https://www.npmjs.com/package/@cmnyhh/dsh-mnemo"><img src="https://img.shields.io/npm/v/@cmnyhh/dsh-mnemo?label=npm" alt="npm"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License"></a>
 </p>
 
@@ -65,11 +65,138 @@ curl -X POST http://localhost:8090/v1/memory/search \
 
 The second call returns the entry just written, together with its score, the retrieval path that produced it, and an `injection` block ready to be placed in a prompt.
 
-## Connect an agent
+## Docker Compose deployment
+
+The repository ships a compose file with three services — `db` (PostgreSQL 18 with BM25), `qdrant`, and `service`. On a server that has Docker and Compose v2, two files are enough and nothing has to be cloned.
+
+`compose.yaml`:
+
+```yaml
+name: memory
+
+services:
+  db:
+    image: yejiu233/mnemo-db:18
+    restart: unless-stopped
+    shm_size: 256mb
+    mem_limit: 768m
+    environment:
+      POSTGRES_DB: memory
+      POSTGRES_USER: memory
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      TZ: Asia/Shanghai
+    command:
+      - postgres
+      - -c
+      - shared_buffers=384MB
+      - -c
+      - maintenance_work_mem=128MB
+      - -c
+      - effective_cache_size=1536MB
+      - -c
+      - shared_preload_libraries=pg_textsearch
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U memory -d memory"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    ports:
+      - "127.0.0.1:5432:5432"
+
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    restart: unless-stopped
+    mem_limit: 320m
+    environment:
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:?set QDRANT_API_KEY in .env}
+      QDRANT__STORAGE__ON_DISK_PAYLOAD: "true"
+      QDRANT__TELEMETRY_DISABLED: "true"
+    volumes:
+      - qdrant:/qdrant/storage
+    ports:
+      - "127.0.0.1:6333:6333"
+
+  service:
+    image: yejiu233/mnemo:1.4.9
+    restart: unless-stopped
+    mem_limit: 1280m
+    environment:
+      MEMORY_DB_URL: jdbc:postgresql://db:5432/memory
+      MEMORY_DB_USER: memory
+      MEMORY_DB_PASSWORD: ${POSTGRES_PASSWORD}
+      MEMORY_QDRANT_URL: http://qdrant:6333
+      MEMORY_QDRANT_API_KEY: ${QDRANT_API_KEY}
+      MEMORY_TENANT: ${MEMORY_TENANT:-default}
+      MEMORY_ADMIN_USERNAME: ${MEMORY_ADMIN_USERNAME:-admin}
+      MEMORY_ADMIN_PASSWORD: ${MEMORY_ADMIN_PASSWORD:-}
+      MEMORY_ADMIN_COOKIE_SECURE: ${MEMORY_ADMIN_COOKIE_SECURE:-auto}
+      MEMORY_EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-hash}
+      MEMORY_EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-}
+      MEMORY_EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      MEMORY_EMBEDDING_MODEL: ${EMBEDDING_MODEL:-qwen3-embedding-8b}
+      MEMORY_EMBEDDING_DIMS: ${EMBEDDING_DIMS:-4096}
+      MEMORY_ASSETS_DIR: /data/assets
+      TZ: Asia/Shanghai
+    depends_on:
+      db:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    volumes:
+      - assets:/data/assets
+    ports:
+      - "${MNEMO_PORT:-8090}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/v1/memory/health >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  pgdata:
+  qdrant:
+  assets:
+```
+
+`.env` — only the two secrets are mandatory, every other variable has a default. The heredoc below lets the shell generate them:
 
 ```bash
-npm install mnemo-memory-core
+cat > .env <<EOF
+POSTGRES_PASSWORD=$(openssl rand -base64 24 | tr -d '\n')
+QDRANT_API_KEY=$(openssl rand -base64 24 | tr -d '\n')
+MEMORY_ADMIN_PASSWORD=$(openssl rand -base64 18 | tr -d '\n')
+EOF
+chmod 600 .env
+docker compose up -d
+docker compose ps        # wait for service to report healthy
 ```
+
+`MEMORY_ADMIN_PASSWORD` is read on first boot and written to the database; editing `.env` later does not change it — change it from the console.
+
+Points worth knowing before putting it on a network:
+
+- **Only `service` is published.** PostgreSQL and Qdrant bind to `127.0.0.1`, and `service` listens on `0.0.0.0:8090` so a reverse proxy in another container can reach it. Put HTTPS in front before exposing it, or change the mapping to `127.0.0.1:8090:8080`.
+- **Volume names carry the data.** The project name (`name: memory`) prefixes the three volumes; rename it and Compose mounts empty ones, which looks exactly like data loss.
+- **Upgrade** is `docker compose pull && docker compose up -d`. The schema is idempotent and is applied at boot, so no migration step is needed.
+- **Back up PostgreSQL**; vectors and full-text indexes are derived and can be rebuilt from it. If you use attachments, add the `assets` volume: `docker compose exec db pg_dump -U memory memory | gzip > memory-$(date +%F).sql.gz`.
+- **Without the repository's `db/init` the service still works**: the required extensions are created on first boot.
+- **Semantic recall needs an embedding endpoint.** The snippet defaults to `hash`, a local deterministic vector that only proves the pipeline works; point `EMBEDDING_PROVIDER=http` at an OpenAI-compatible endpoint (or set it later on the console **Config** page) to get real recall.
+
+The full variable list, reverse-proxy examples and resource sizing are in [Operations](docs/operations.md).
+
+## Connect an agent
+
+The plugin is published on npm as [`@cmnyhh/dsh-mnemo`](https://www.npmjs.com/package/@cmnyhh/dsh-mnemo):
+
+```bash
+npm install @cmnyhh/dsh-mnemo
+```
+
+Package page: <https://www.npmjs.com/package/@cmnyhh/dsh-mnemo> · container images: <https://hub.docker.com/r/yejiu233/mnemo>
 
 Without a plugin host, call the API directly:
 

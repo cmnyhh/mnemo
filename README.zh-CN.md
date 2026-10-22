@@ -7,8 +7,8 @@
 <p align="center">自托管的 AI 长期记忆服务。</p>
 
 <p align="center">
-  <a href="https://hub.docker.com/r/yejiu233/mnemo"><img src="https://img.shields.io/docker/pulls/cmnyhh/mnemo?label=docker%20pulls" alt="Docker pulls"></a>
-  <a href="https://www.npmjs.com/package/mnemo-memory-core"><img src="https://img.shields.io/npm/v/mnemo-memory-core" alt="npm"></a>
+  <a href="https://hub.docker.com/r/yejiu233/mnemo"><img src="https://img.shields.io/docker/pulls/yejiu233/mnemo?label=docker%20pulls" alt="Docker pulls"></a>
+  <a href="https://www.npmjs.com/package/@cmnyhh/dsh-mnemo"><img src="https://img.shields.io/npm/v/@cmnyhh/dsh-mnemo?label=npm" alt="npm"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License"></a>
 </p>
 
@@ -41,7 +41,7 @@ docker compose up -d
 
 凭据保存在 `.env`。首次启动后修改 `.env` 不会重置控制台口令：它在首次启动时写入数据库，之后在控制台修改。若需手工配置，参见 `.env.example` 中的注释。
 
-镜像由 GitHub Actions 构建，发布到 [Docker Hub](https://hub.docker.com/r/yejiu233/mnemo)，`docker compose up` 默认拉的就是它；同样的标签也镜像到 GHCR，拉不到 Hub 的网络把 `MNEMO_IMAGE` / `MNEMO_DB_IMAGE` 设成 `ghcr.io/cmnyhh/mnemo:1.2.0` 与 `ghcr.io/cmnyhh/mnemo-db:18` 即可。需要从源码构建时，叠加构建文件即可，首次约十分钟：
+镜像由 GitHub Actions 构建，发布到 [Docker Hub](https://hub.docker.com/r/yejiu233/mnemo)，`docker compose up` 默认拉的就是它；同样的标签也镜像到 GHCR，拉不到 Hub 的网络把 `MNEMO_IMAGE` / `MNEMO_DB_IMAGE` 设成 `ghcr.io/cmnyhh/mnemo:1.4.9` 与 `ghcr.io/cmnyhh/mnemo-db:18` 即可。需要从源码构建时，叠加构建文件即可，首次约十分钟：
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
@@ -65,11 +65,138 @@ curl -X POST http://localhost:8090/v1/memory/search \
 
 第二次调用返回刚写入的条目，包含分数、命中的检索通道，以及可直接放入提示词的 `injection` 字段。
 
-## 接入 Agent
+## 用 Docker Compose 部署
+
+仓库里的 compose 文件包含三个服务：`db`（PostgreSQL 18 + BM25）、`qdrant`、`service`。在装了 Docker 与 Compose v2 的服务器上，两个文件即可起一套，不需要克隆仓库。
+
+`compose.yaml`：
+
+```yaml
+name: memory
+
+services:
+  db:
+    image: yejiu233/mnemo-db:18
+    restart: unless-stopped
+    shm_size: 256mb
+    mem_limit: 768m
+    environment:
+      POSTGRES_DB: memory
+      POSTGRES_USER: memory
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请在 .env 里设置 POSTGRES_PASSWORD}
+      TZ: Asia/Shanghai
+    command:
+      - postgres
+      - -c
+      - shared_buffers=384MB
+      - -c
+      - maintenance_work_mem=128MB
+      - -c
+      - effective_cache_size=1536MB
+      - -c
+      - shared_preload_libraries=pg_textsearch
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U memory -d memory"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    ports:
+      - "127.0.0.1:5432:5432"
+
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    restart: unless-stopped
+    mem_limit: 320m
+    environment:
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:?请在 .env 里设置 QDRANT_API_KEY}
+      QDRANT__STORAGE__ON_DISK_PAYLOAD: "true"
+      QDRANT__TELEMETRY_DISABLED: "true"
+    volumes:
+      - qdrant:/qdrant/storage
+    ports:
+      - "127.0.0.1:6333:6333"
+
+  service:
+    image: yejiu233/mnemo:1.4.9
+    restart: unless-stopped
+    mem_limit: 1280m
+    environment:
+      MEMORY_DB_URL: jdbc:postgresql://db:5432/memory
+      MEMORY_DB_USER: memory
+      MEMORY_DB_PASSWORD: ${POSTGRES_PASSWORD}
+      MEMORY_QDRANT_URL: http://qdrant:6333
+      MEMORY_QDRANT_API_KEY: ${QDRANT_API_KEY}
+      MEMORY_TENANT: ${MEMORY_TENANT:-default}
+      MEMORY_ADMIN_USERNAME: ${MEMORY_ADMIN_USERNAME:-admin}
+      MEMORY_ADMIN_PASSWORD: ${MEMORY_ADMIN_PASSWORD:-}
+      MEMORY_ADMIN_COOKIE_SECURE: ${MEMORY_ADMIN_COOKIE_SECURE:-auto}
+      MEMORY_EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-hash}
+      MEMORY_EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-}
+      MEMORY_EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      MEMORY_EMBEDDING_MODEL: ${EMBEDDING_MODEL:-qwen3-embedding-8b}
+      MEMORY_EMBEDDING_DIMS: ${EMBEDDING_DIMS:-4096}
+      MEMORY_ASSETS_DIR: /data/assets
+      TZ: Asia/Shanghai
+    depends_on:
+      db:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    volumes:
+      - assets:/data/assets
+    ports:
+      - "${MNEMO_PORT:-8090}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/v1/memory/health >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  pgdata:
+  qdrant:
+  assets:
+```
+
+`.env`：只有两个凭据是必填，其余变量都有默认值。下面这段让 shell 直接把随机值写进去：
 
 ```bash
-npm install mnemo-memory-core
+cat > .env <<EOF
+POSTGRES_PASSWORD=$(openssl rand -base64 24 | tr -d '\n')
+QDRANT_API_KEY=$(openssl rand -base64 24 | tr -d '\n')
+MEMORY_ADMIN_PASSWORD=$(openssl rand -base64 18 | tr -d '\n')
+EOF
+chmod 600 .env
+docker compose up -d
+docker compose ps        # 等到 service 显示 healthy
 ```
+
+`MEMORY_ADMIN_PASSWORD` 在首次启动时读取并写进数据库；之后再改 `.env` 不会覆盖，要改请走控制台。
+
+对外之前值得知道的几点：
+
+- **只有 `service` 对外开端口。** PostgreSQL 与 Qdrant 只绑 `127.0.0.1`；`service` 监听 `0.0.0.0:8090`，是为了让另一个容器里的反代能连上。没有 HTTPS 反代时，请把它改成 `127.0.0.1:8090:8080`。
+- **卷名带着数据。** 三个卷以项目名（`name: memory`）为前缀，改名等于换一套栈，挂的是空卷——看起来就像数据丢了。
+- **升级**是 `docker compose pull && docker compose up -d`。schema 幂等、启动时应用，不需要单独的迁移步骤。
+- **备份 PostgreSQL 即可**，向量与全文索引都是派生的、能从它重建；用了附件的话再带上 `assets` 卷：`docker compose exec db pg_dump -U memory memory | gzip > memory-$(date +%F).sql.gz`。
+- **不带仓库里的 `db/init` 也能跑**：需要的扩展由服务在首次启动时创建。
+- **语义召回要配 embedding 端点**：上面默认 `hash`，那是本地确定性向量，只够把链路跑通；要真召回请把 `EMBEDDING_PROVIDER` 改成 `http` 并填端点（也可以之后在控制台「配置」页配）。
+
+完整变量表、反代示例与资源配置见[部署与运维](docs/operations.md)。
+
+## 接入 Agent
+
+插件已发布到 npm：[`@cmnyhh/dsh-mnemo`](https://www.npmjs.com/package/@cmnyhh/dsh-mnemo)。
+
+```bash
+npm install @cmnyhh/dsh-mnemo
+```
+
+npm 地址：<https://www.npmjs.com/package/@cmnyhh/dsh-mnemo> · 镜像地址：<https://hub.docker.com/r/yejiu233/mnemo>
 
 没有插件宿主时，直接调用接口：
 
