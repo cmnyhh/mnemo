@@ -9,6 +9,9 @@ import com.hs.memory.extract.ExtractException;
 import com.hs.memory.extract.ExtractResult;
 import com.hs.memory.extract.ExtractedItem;
 import com.hs.memory.extract.Extractor;
+import com.hs.memory.extract.Summarizer;
+import com.hs.memory.extract.Summary;
+import com.hs.memory.guard.NoiseFilter;
 import com.hs.memory.guard.TrustPolicy;
 import com.hs.memory.guard.WriteReview;
 import com.hs.memory.repo.MemoryRepository;
@@ -100,25 +103,54 @@ public class IngestService {
     private IngestResponse doIngest(String tenantId, UUID tokenId, IngestRequest req) {
         List<IngestRequest.Item> items = req.items();
         String extraction;
+        String batchNote = null;
+        // 用户显式说「记住」＝他本人授权。这条路上不做任何内容过滤：
+        // 用户要记住的东西长什么样都该收，形状过滤只对付「自动捕获」的那条路。
+        boolean explicit = req.turn() != null && "explicit".equalsIgnoreCase(req.turn().trigger());
         if (items != null && !items.isEmpty()) {
             extraction = "structured";
         } else if (req.turn() != null && req.turn().messages() != null && !req.turn().messages().isEmpty()) {
-            TurnExtraction extracted = extractTurn(req.turn());
+            TurnExtraction extracted = extractTurn(req.turn(), explicit);
+            if (!extracted.admitted()) {
+                // 准入被拒是**有效结论**，不是失败：把理由回给写入方，别让它以为写成功了。
+                return new IngestResponse("rejected", 0, 0, List.of(), extracted.note());
+            }
             items = extracted.items();
             extraction = extracted.mode();
+            batchNote = extracted.note();
         } else {
             throw new IllegalArgumentException("items 与 turn 至少要提供一个");
         }
         if (items == null || items.isEmpty()) {
             // 抽取模型判定「这轮没什么值得记的」是有效结论，不是失败。
-            return new IngestResponse(extraction, 0, 0, List.of());
+            return new IngestResponse(extraction, 0, 0, List.of(), batchNote);
         }
 
         List<IngestResponse.Result> results = new ArrayList<>();
         int accepted = 0;
         int duplicates = 0;
+        int noise = 0;
         for (int i = 0; i < items.size(); i++) {
-            Prepared prepared = prepare(tenantId, tokenId, req, items.get(i), i, items.size());
+            IngestRequest.Item current = items.get(i);
+            // ★ 不能用 sourceKind 判「要不要过滤」：items 路径缺省就是 manual，
+            // 工具写入（memory_write）走的正是这条路——白绫把自己的系统提示、
+            // 群消息原文 JSON 当 fact 写进来时，sourceKind 也是 manual。
+            // 唯一该豁免的是 trigger=explicit（用户明确要求记住）。
+            if (!explicit) {
+                // 工具写入允许存 JSON 报文、代码块、令牌这类内容，所以只查脚手架形状；
+                // 抽取出来的条目已经是正常文本，同样走这一套即可。
+                String reason = NoiseFilter.scaffolding(current.narrative());
+                if (reason != null) {
+                    // 形状过滤：提示词模板 / 工具回显 / 运行态脚手架。
+                    // 它跑在模型之外，所以抽取超时回落的那条路上也照样生效。
+                    noise++;
+                    metrics.admission("rules");
+                    log.info("写入被形状过滤拦下 tenant={} reason={} head={}",
+                            tenantId, reason, head(current.narrative()));
+                    continue;
+                }
+            }
+            Prepared prepared = prepare(tenantId, tokenId, req, current, i, items.size());
             NewItem item = prepared.item();
             Persisted persisted = persist(item);
             // 被取代的旧事实要把向量 payload 也改成 superseded：否则 dense 一路还会把它当成
@@ -141,7 +173,9 @@ public class IngestService {
             results.add(new IngestResponse.Result(persisted.id().toString(),
                     item.kind(), false, note == null, note));
         }
-        return new IngestResponse(extraction, accepted, duplicates, results);
+        return new IngestResponse(extraction, accepted, duplicates, results,
+                noise == 0 ? batchNote
+                        : join(batchNote, noise + " 条被形状过滤拦下（提示词模板 / 工具回显 / 运行态脚手架）"));
     }
 
     /** 待写条目 + 写入审查留下的说明（没有任何拦改时为 null）。 */
@@ -152,44 +186,215 @@ public class IngestService {
     private record Persisted(UUID id, boolean duplicate, UUID superseded) {
     }
 
-    /** 抽取结果 + 本轮走了哪条路（回给调用方，便于判断记忆为什么没进来）。 */
-    private record TurnExtraction(List<IngestRequest.Item> items, String mode) {
+    /**
+     * 抽取结果 + 本轮走了哪条路（回给调用方，便于判断记忆为什么没进来）。
+     *
+     * @param admitted false 表示模型判定这轮不该进记忆，{@code note} 里是理由
+     */
+    private record TurnExtraction(List<IngestRequest.Item> items, String mode, boolean admitted,
+                                  String note) {
     }
 
     /**
-     * 把一轮对话变成待写条目：配了抽取模型就交给模型，失败才回落按段硬切。
+     * 把一轮对话变成待写条目。两条产出分开算账：
      *
-     * <p>模型返回空列表是**有效结论**——这轮确实没什么值得记的。不能把它当失败去硬切，
-     * 否则闲聊会被写成 episode，以后每次同类提问都命中一段废话，白占注入预算。
+     * <ul>
+     *   <li><b>对话记录</b>——每轮都写，内容由总结模型压成一条「聊了什么」的摘要，
+     *       压不出来才回落规则拼原文。它回答「我们聊过什么」，价值来自覆盖率，
+     *       所以不该被任何准入判断否掉。</li>
+     *   <li><b>事实抽取</b>——只在客户端报了信号（explicit / change / repair）时才花钱调模型。
+     *       它回答「什么是长期成立的」，模型的 admit 只决定这一半。</li>
+     * </ul>
+     *
+     * <p>以前这两件事共用一个 {@code admit}：模型判「这轮没什么可记的」，整轮就被丢掉，
+     * 于是普通聊天永远查不到。记录和事实的判据本来就不同，不该共用一个开关。
      */
-    private TurnExtraction extractTurn(IngestRequest.Turn turn) {
+    private TurnExtraction extractTurn(IngestRequest.Turn turn, boolean explicit) {
+        if (!explicit && !hasSignal(turn)) {
+            Logged logged = logTurn(turn);
+            if (logged.items().isEmpty()) {
+                metrics.admission("rules");
+                return new TurnExtraction(List.of(), "log-skipped", true,
+                        "filtered".equals(logged.mode())
+                                ? "本轮没有可记的对话内容（只有宿主脚手架，或用户侧没有实际内容）"
+                                : "本轮只有系统/工具消息，没有可记的对话内容");
+            }
+            metrics.admission("log");
+            return new TurnExtraction(logged.items(), modeOf(logged), true,
+                    "summary".equals(logged.mode())
+                            ? "已记对话摘要（本轮无变更信号，未抽事实）"
+                            : "摘要模型不可用，已按原文记对话日志（未抽事实）");
+        }
         Extractor extractor = config.extractor();
         if (!extractor.available()) {
-            return new TurnExtraction(fromTurn(turn), "episode-fallback");
+            return summaryOnly(turn, "未配置抽取模型");
         }
         try {
             long stage = System.nanoTime();
             ExtractResult result;
             try {
-                result = extractor.extract(joinTurn(turn));
+                result = extractor.extract(explicit ? explicitPrefix() + joinTurn(turn) : joinTurn(turn));
             } finally {
                 metrics.ingestStage("extract", System.nanoTime() - stage);
             }
-            log.info("抽取完成 model={} items={} latency={}ms",
-                    result.model(), result.count(), result.latencyMs());
-            return new TurnExtraction(toItems(result), "llm-extract");
+            // 显式写入只有模型抽不出来（items 空）才会丢，不会因为准入判断被整段否掉。
+            if (!result.admitted() && !explicit) {
+                // 准入被拒：模型判定这段不适合沉淀成事实。记录照写——被拒的是「抽取」，不是「记录」。
+                // 与「抽到 0 条」分开计数，否则「上游发错东西」会被当成「抽取太保守」。
+                metrics.admission("reject");
+                log.info("准入拒绝 model={} reason={} latency={}ms（对话记录仍然保留）",
+                        result.model(), result.reason(), result.latencyMs());
+                Logged logged = withLog(turn, List.of(), result.summary());
+                return new TurnExtraction(logged.items(),
+                        logged.items().isEmpty() ? "admission-rejected" : modeOf(logged), true,
+                        "未抽成事实（" + result.reason() + "），仅记对话记录");
+            }
+            metrics.admission("keep");
+            log.info("抽取完成 model={} items={} latency={}ms reason={}",
+                    result.model(), result.count(), result.latencyMs(), result.reason());
+            return new TurnExtraction(withLog(turn, toItems(result), result.summary()).items(),
+                    "llm-extract", true, null);
         } catch (ExtractException e) {
-            // 抽取降级成硬切：写入还能成功，但记下来的是一段原文而不是事实，值得单独计数
+            // 抽取失败不再直接硬切：先试试摘要，成功的话这一轮是「一条记录」而不是「十二段原文」。
+            // 这条路上没有事实产出，值得单独计数。
             metrics.degrade("extract");
-            log.warn("抽取失败，回落按段硬切: {}", e.getMessage());
-            return new TurnExtraction(fromTurn(turn), "episode-fallback");
+            log.warn("抽取失败，改用摘要: {}", e.getMessage());
+            return summaryOnly(turn, "抽取模型不可用");
         }
+    }
+
+    /**
+     * 抽取不可用时的退路：至少留下一条对话记录。
+     *
+     * <p>以前这里直接 {@link #fromTurn} 硬切原文，结果是「模型一挂，库里全是碎段原文」。
+     * 摘要与抽取共用同一个模型，所以它很可能也在挂——但值得再试一次：失败只多一次 HTTP，
+     * 成功就把十二段碎原文换成一条记录。
+     */
+    private TurnExtraction summaryOnly(IngestRequest.Turn turn, String why) {
+        Logged logged = logTurn(turn);
+        if (!logged.items().isEmpty()) {
+            return new TurnExtraction(logged.items(), modeOf(logged), true,
+                    why + ("summary".equals(logged.mode()) ? "，已记对话摘要" : "，已按原文记对话日志"));
+        }
+        List<IngestRequest.Item> segments = fromTurn(turn);
+        return new TurnExtraction(segments, "episode-fallback", true,
+                why + "，摘要也不可用，按段硬切（已过滤提示词模板与工具回显）");
+    }
+
+    /** 日志产出的模式名，回给写入方并进指标：用来回答「这一轮记的到底是摘要还是原文」。 */
+    private static String modeOf(Logged logged) {
+        return "summary".equals(logged.mode()) ? "log-summary" : "summary-fallback";
+    }
+
+    /** 客户端是否报了「本轮发生过什么」。没有信号就只记摘要，不花钱抽事实。 */
+    private static boolean hasSignal(IngestRequest.Turn turn) {
+        return ConversationLog.hasSignal(turn.trigger());
+    }
+
+    /** 一轮对话的日志产出：条目 + 它是「模型摘要」还是「原文回退」。 */
+    private record Logged(List<IngestRequest.Item> items, String mode) {
+    }
+
+    /**
+     * 对话记录：先让总结模型把这轮压成一条摘要，压不出来才回落原文拼接。
+     *
+     * <p>为什么不再直接存原文：原文是逐字转录，库里躺的是「用户：…… 助手：……」这种对话壳，
+     * 检索命中的也是壳；一轮七八条消息还各占一份索引。摘要把一轮收敛成一条带结论的记录，
+     * 回答的正是「我们聊过什么」。代价是每轮一次模型调用——这是明确选择过的取舍：
+     * 宁可慢一点，也要让入记忆的是「聊了什么」，不是「原话长什么样」。
+     *
+     * <p>但摘要失败不允许丢记录：模型不可用、超时、给空摘要，一律回落
+     * {@link ConversationLog#compose}（规则拼原文，确定性），一条都不少。
+     *
+     * <p>形状过滤挡在摘要之前：先判断「整轮是不是宿主塞的脚手架」，命中就既不摘也不存——
+     * 让模型去总结一段系统提示，等于花钱把提示词改写一遍写进记忆。
+     */
+    private Logged logTurn(IngestRequest.Turn turn) {
+        String raw = ConversationLog.compose(turn.messages());
+        if (raw.isEmpty()) {
+            return new Logged(List.of(), "none");
+        }
+        // 用宽松档：原文里出现代码块、JSON、令牌都是正常的，不该因此丢掉。
+        // 要挡的只有「整轮都是宿主塞进来的脚手架」，那正是 scaffolding 的五条。
+        String reason = NoiseFilter.scaffolding(raw);
+        if (reason != null) {
+            log.info("对话记录被形状过滤拦下 reason={} head={}", reason, head(raw));
+            return new Logged(List.of(), "filtered");
+        }
+        // 剥完信封只剩几个字，说明这轮没人真正说话（私聊里试键盘的「fsasf」、
+        // 群里被唤醒却没人接话）。不拦的话，桥接的每一条唤醒都会在库里留一条噪声。
+        // 有信号轮不走这条判据：那走的是抽取，短句「端口改成 9090」正是最该留的。
+        if (!hasSignal(turn)) {
+            int userChars = ConversationLog.userChars(turn.messages());
+            if (userChars < ConversationLog.MIN_USER_CHARS) {
+                log.info("对话没有实质内容（用户侧 {} 字），不记 head={}", userChars, head(raw));
+                return new Logged(List.of(), "filtered");
+            }
+        }
+        Summarizer summarizer = config.summarizer();
+        if (summarizer.available()) {
+            try {
+                long stage = System.nanoTime();
+                Summary summary;
+                try {
+                    summary = summarizer.summarize(raw);
+                } finally {
+                    metrics.ingestStage("summarize", System.nanoTime() - stage);
+                }
+                if (summary.usable()) {
+                    log.info("对话摘要 model={} chars={} keywords={} latency={}ms",
+                            summary.model(), summary.text().length(), summary.keywords().size(),
+                            summary.latencyMs());
+                    return new Logged(
+                            List.of(logItem(summary.text(), summary.keywords(), turn.index())), "summary");
+                }
+            } catch (ExtractException e) {
+                metrics.degrade("summarize");
+                log.warn("对话摘要失败，回落原文: {}", e.getMessage());
+            }
+        }
+        // 回退才收长度：raw 是喂模型的宽版本（可达 8000 字），直接入库会挤掉整轮注入预算。
+        return new Logged(List.of(logItem(ConversationLog.condense(raw), List.of(), turn.index())), "raw");
+    }
+
+    /**
+     * 一条对话记录。importance 压到 0.3：分层治理按 importance &lt; 0.5 归档，
+     * 否则每轮一条，几个月后整个库都是聊天记录。
+     */
+    private IngestRequest.Item logItem(String narrative, List<String> hints, Integer turnIndex) {
+        return new IngestRequest.Item("episode", "project", null, narrative, Map.of(),
+                hints, null, null, null, 0.3, 0.6, "medium", null, null, "turn", turnIndex);
+    }
+
+    /**
+     * 有信号轮：记录 + 抽出来的事实一起写。记录放前面，读起来才是「先这轮，后结论」。
+     *
+     * <p>抽取那一次调用已经顺带给了摘要，就不再打第二次模型；它没给（旧模型、畸形输出）
+     * 才回落 {@link #logTurn}。
+     */
+    private Logged withLog(IngestRequest.Turn turn, List<IngestRequest.Item> items, String summaryText) {
+        Logged logged = summaryText == null || summaryText.isBlank()
+                ? logTurn(turn)
+                : new Logged(List.of(logItem(summaryText, List.of(), turn.index())), "summary");
+        if (logged.items().isEmpty()) {
+            return new Logged(items, logged.mode());
+        }
+        List<IngestRequest.Item> out = new ArrayList<>(logged.items().size() + items.size());
+        out.addAll(logged.items());
+        out.addAll(items);
+        return new Logged(out, logged.mode());
     }
 
     private String joinTurn(IngestRequest.Turn turn) {
         StringBuilder sb = new StringBuilder();
         for (IngestRequest.Message m : turn.messages()) {
             String content = m.content() == null ? "" : m.content().trim();
+            if (content.isEmpty()) {
+                continue;
+            }
+            // 抽取也要先剥信封：把三千字的角色设定与表情包策略喂给模型，
+            // 它只会判「这是提示词模板」然后整轮拒收，真正群聊的那两句反倒看不到。
+            content = Envelope.strip(content);
             if (content.isEmpty()) {
                 continue;
             }
@@ -430,17 +635,33 @@ public class IngestService {
    */
   private List<IngestRequest.Item> fromTurn(IngestRequest.Turn turn) {
     List<IngestRequest.Item> out = new ArrayList<>();
+    int seen = 0;
     for (IngestRequest.Message m : turn.messages()) {
         String content = m.content() == null ? "" : m.content().trim();
         if (content.isEmpty()) {
             continue;
         }
-        if ("user".equalsIgnoreCase(nullSafe(m.role())) && isQuestion(content)) {
+        seen++;
+        String role = lower(m.role(), "");
+        // 工具返回与系统提示不是「对话」：硬切它们只会把日志和提示词写成记忆。
+        if ("tool".equals(role) || "system".equals(role) || "function".equals(role)) {
+            metrics.admission("rules");
+            continue;
+        }
+        if ("user".equals(role) && isQuestion(content)) {
             continue;
         }
         for (String segment : splitSegments(content)) {
             // 太短的段落（"好的" "收到"）没有可召回的内容，但会长期占着索引。
             if (segment.length() < MIN_SEGMENT_CHARS) {
+                continue;
+            }
+            // 这条兜底路径不经过模型，形状过滤是唯一的闸门。命中就整段丢弃：
+            // 把提示词模板切碎了写进去，比这一轮没记住更糟——它会被反复召回注入。
+            String reason = NoiseFilter.reason(segment);
+            if (reason != null) {
+                metrics.admission("rules");
+                log.info("兜底切段被形状过滤拦下 reason={} head={}", reason, head(segment));
                 continue;
             }
             if (out.size() >= TURN_MAX_SEGMENTS) {
@@ -450,9 +671,10 @@ public class IngestService {
                     null, null, null, null, 0.5, 0.7, "medium", null, null, "turn", null));
         }
     }
-    if (out.isEmpty()) {
+    if (seen == 0) {
         throw new IllegalArgumentException("turn.messages 里没有可用的 content");
     }
+    // 全部被过滤掉是正常结果（这一轮只剩脚手架），交给上层回 0 条 + 说明。
     return out;
   }
 
@@ -564,6 +786,24 @@ public class IngestService {
 
     private static String nullSafe(String s) {
         return s == null ? "" : s;
+    }
+
+    /**
+     * 显式写入时垫在模型输入前的一句话。
+     *
+     * <p>没有它，「记住 1asnc@SNCAnujasa」会被准入规则当成随机串否掉——而那正是用户
+     * 唯一明确要求记住的东西。准入判断服务于「自动捕获」，不该否决人工指令。
+     */
+    private static String explicitPrefix() {
+        return "【用户已明确要求记住下面的内容：admit 必须为 true，即使是随机串或编码也要原样记下】\n";
+    }
+
+    /** 日志里只露个头：整段提示词打进 journal 会把它淹掉。 */
+    private static String head(String s) {        if (s == null) {
+            return "";
+        }
+        String t = s.replaceAll("\\s+", " ").trim();
+        return t.length() <= 40 ? t : t.substring(0, 40) + "…";
     }
 
     private static String blankToNull(String s) {

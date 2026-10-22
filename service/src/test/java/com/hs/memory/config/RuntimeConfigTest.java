@@ -86,6 +86,28 @@ class RuntimeConfigTest {
     }
 
     @Test
+    void oneOutOfRangeOverrideDoesNotDiscardTheRestOfTheConfiguration() {
+        // 复现 2026-10-22 的事故：把 dense-top-k 写成 300（上限 200），
+        // 以前会让整份 app_config 校验失败、全部退回环境变量基线。
+        FakeStore store = new FakeStore();
+        store.values.put(ConfigSpec.DENSE_TOP_K, 300);
+        store.values.put(ConfigSpec.DENSE_MIN_SCORE, 0.42);
+        store.values.put(ConfigSpec.NEIGHBOR_RADIUS, 3);
+        RuntimeConfig runtime = new RuntimeConfig(TestSettings.of(), store);
+
+        runtime.reload();
+
+        assertThat(runtime.loaded()).isTrue();
+        // 合法的覆盖照常生效
+        assertThat(runtime.snapshot().denseMinScore()).isEqualTo(0.42);
+        assertThat(runtime.snapshot().neighborRadius()).isEqualTo(3);
+        // 坏的那一条回落基线，而不是让整份配置一起消失
+        assertThat(runtime.overrides()).doesNotContainKey(ConfigSpec.DENSE_TOP_K);
+        assertThat(runtime.snapshot().denseTopK())
+                .isEqualTo(runtime.spec().baseline().get(ConfigSpec.DENSE_TOP_K));
+    }
+
+    @Test
     void embeddingClientFollowsTheCurrentConfiguration() {
         FakeStore store = new FakeStore();
         RuntimeConfig runtime = new RuntimeConfig(TestSettings.of(), store);

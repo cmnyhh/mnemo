@@ -68,8 +68,11 @@ memory:
     dense-min-score: ${MEMORY_DENSE_MIN_SCORE:0.25}
     # 邻域扩展：一条记忆 = 一轮对话，单独给出去常常缺前因后果（「她答应了」离开上一轮不可解）。
     # 命中后把同会话前后各 N 轮一并注入，0 = 关闭。上限单次最多补几条，避免把注入块撑爆。
-    neighbor-radius: ${MEMORY_NEIGHBOR_RADIUS:1}
-    neighbor-max: ${MEMORY_NEIGHBOR_MAX:6}
+    # 2 / 14 是 LoCoMo 全量实测值：±1（1/6）58.6% → ±2（2/14）60.5%，配对净增 +38，p<0.05。
+    # ★ 只改 radius 无效 —— max 才是天花板（NEIGHBOR_ANCHORS=6 个锚点 × 每侧 radius 条），
+    #   两个必须一起抬，否则回填被截断到 6 条，跑完会误判成「回填没用」。
+    neighbor-radius: ${MEMORY_NEIGHBOR_RADIUS:2}
+    neighbor-max: ${MEMORY_NEIGHBOR_MAX:14}
   # 精排（cross-encoder）。none = 不精排，等价于历史行为（按 RRF 名次输出）。
   # 精排是「排序精度」手段，不是召回的必要条件；它在融合之后、截断之前介入。
   rerank:

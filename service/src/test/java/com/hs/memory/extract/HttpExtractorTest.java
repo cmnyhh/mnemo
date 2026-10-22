@@ -83,6 +83,74 @@ class HttpExtractorTest {
         assertTrue(item.hasTriple());
     }
 
+    /**
+     * 线上真实故障：GLM-4-9B 想说「没什么可记的」，吐的是 {@code {"items":[]"}}（多一个引号）。
+     * 严格解析失败 → 上层回落按段硬切 → 整段提示词被写成 episode。
+     * 这条用例锁死「空结论不能被当成格式错误」。
+     */
+    @Test
+    void malformedEmptyItemsIsAnEmptyConclusionNotAFailure() throws Exception {
+        String base = startWithContent("{\"items\":[]\"}", 200, null);
+
+        ExtractResult r = extractor(base).extract("对话内容");
+
+        assertEquals(0, r.count());
+        assertTrue(r.admitted());
+    }
+
+    /**
+     * 线上真实输出（2026-10-22 13:24）：模型判了「不该记」，但收尾多吐一个引号。
+     * 不修这一处，每次「不该记」都会退化成硬切，把整轮提示词写成记忆。
+     */
+    @Test
+    void repairsStrayTrailingQuoteOnAdmitFalse() throws Exception {
+        String base = startWithContent(
+                "{\"admit\":false,\"reason\":\"运行态脚手架内容\",\"items\":[]\"}", 200, null);
+
+        ExtractResult r = extractor(base).extract("对话内容");
+
+        assertEquals(0, r.count());
+        assertFalse(r.admitted());
+        assertEquals("运行态脚手架内容", r.reason());
+    }
+
+    @Test
+    void admitFalseYieldsNoItems() throws Exception {        String base = startWithContent("""
+                {"admit":false,"reason":"提示词模板","items":[]}
+                """, 200, null);
+
+        ExtractResult r = extractor(base).extract("对话内容");
+
+        assertEquals(0, r.count());
+        assertFalse(r.admitted());
+        assertEquals("提示词模板", r.reason());
+    }
+
+    /**
+     * 准入被拒只否掉「沉淀成事实」，不否掉「这轮聊过什么」。
+     * 摘要必须跟着结果一起出来，否则被拒的轮次在记忆里会彻底消失。
+     */
+    @Test
+    void admitFalseStillCarriesSummary() throws Exception {
+        String base = startWithContent("""
+                {"admit":false,"reason":"闲聊","summary":"用户随口问了句今天怎么样，没有实质内容。","items":[]}
+                """, 200, null);
+
+        ExtractResult r = extractor(base).extract("对话内容");
+
+        assertFalse(r.admitted());
+        assertEquals("用户随口问了句今天怎么样，没有实质内容。", r.summary());
+    }
+
+    @Test
+    void admittedResultCarriesSummaryToo() throws Exception {
+        String base = startWithContent("""
+                {"admit":true,"summary":"确认了记忆服务端口是 8080。","items":[]}
+                """, 200, null);
+
+        assertEquals("确认了记忆服务端口是 8080。", extractor(base).extract("x").summary());
+    }
+
     @Test
     void stripsMarkdownFence() throws Exception {
         String base = startWithContent("""

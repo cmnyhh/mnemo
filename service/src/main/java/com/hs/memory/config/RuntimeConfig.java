@@ -6,7 +6,10 @@ import com.hs.memory.embed.HashEmbeddingClient;
 import com.hs.memory.embed.HttpEmbeddingClient;
 import com.hs.memory.extract.Extractor;
 import com.hs.memory.extract.HttpExtractor;
+import com.hs.memory.extract.HttpSummarizer;
 import com.hs.memory.extract.NoopExtractor;
+import com.hs.memory.extract.NoopSummarizer;
+import com.hs.memory.extract.Summarizer;
 import com.hs.memory.rerank.HttpReranker;
 import com.hs.memory.rerank.NoopReranker;
 import com.hs.memory.rerank.Reranker;
@@ -52,6 +55,8 @@ public class RuntimeConfig {
     private volatile String rerankerKey = "";
     private volatile Extractor extractor;
     private volatile String extractorKey = "";
+    private volatile Summarizer summarizer;
+    private volatile String summarizerKey = "";
 
     public RuntimeConfig(Settings settings, ConfigStore store) {
         this.settings = settings;
@@ -101,7 +106,15 @@ public class RuntimeConfig {
                     known.put(e.getKey(), e.getValue());
                 }
             }
-            Map<String, Object> typed = spec.coerce(known);
+            Map<String, Object> typed;
+            try {
+                typed = spec.coerce(known);
+                spec.validate(spec.merge(typed));
+            } catch (IllegalArgumentException bad) {
+                // 一个越界值不该让整份配置作废（见 coerceTolerantly 的注释）。
+                log.warn("配置整体校验未通过，改为逐键剔除坏值：{}", bad.getMessage());
+                typed = coerceTolerantly(known);
+            }
             Map<String, Object> merged = spec.merge(typed);
             spec.validate(merged);
             this.overrides = Map.copyOf(typed);
@@ -117,6 +130,37 @@ public class RuntimeConfig {
         } catch (Exception e) {
             log.warn("配置加载失败，继续使用环境变量基线: {}", e.getMessage());
         }
+    }
+
+    /**
+     * 逐键 coerce + 校验，坏值只丢弃它自己，其余照常生效。
+     *
+     * <p>以前 {@code reload} 是整体调用 {@code spec.coerce}，任何一项越界（例如把
+     * {@code search.dense-top-k} 写成 300，上限 200）都会抛异常、被外层 catch 吞掉，
+     * 于是**整份配置**退回环境变量基线。线上表现是 embedding 模型、维度、服务地址、
+     * API key 一起丢失，向量路静默降级成只剩 BM25，而接口照样返回 200 —— 看不出异常，
+     * 只是结果变差。这类事故在 2026-10-22 真实发生过一次。
+     *
+     * <p>逐键处理把失败范围收敛到一个键：坏的那条回落基线并留一条 warn，其余覆盖继续生效。
+     * 唯一的代价是「需要两个键同时改才合法」的组合会被保守地一起丢掉 —— 那也比整份配置
+     * 消失安全。注意日志只打键名，不打值，避免把密钥写进日志。
+     */
+    private Map<String, Object> coerceTolerantly(Map<String, Object> known) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        for (Map.Entry<String, Object> e : known.entrySet()) {
+            Map<String, Object> single = new LinkedHashMap<>();
+            single.put(e.getKey(), e.getValue());
+            try {
+                Map<String, Object> one = spec.coerce(single);
+                // 用 baseline + 这一个键做跨键校验，能提前发现「单独看就不成立」的覆盖。
+                spec.validate(spec.merge(one));
+                out.putAll(one);
+            } catch (IllegalArgumentException bad) {
+                log.warn("配置项 {} 未通过校验，已忽略该覆盖（其余配置照常生效）：{}",
+                        e.getKey(), bad.getMessage());
+            }
+        }
+        return out;
     }
 
     /**
@@ -205,6 +249,8 @@ public class RuntimeConfig {
         this.rerankerKey = "";
         this.extractor = null;
         this.extractorKey = "";
+        this.summarizer = null;
+        this.summarizerKey = "";
     }
 
     /** 当前配置对应的精排客户端；未配置时返回 Noop，调用方据此走跳过分支。 */
@@ -276,8 +322,44 @@ public class RuntimeConfig {
         return new NoopExtractor();
     }
 
-    /** 表单渲染需要：字段元数据 + 当前值 + 基线 + 覆盖集合。 */
-    public Map<String, Object> describe() {
+    /**
+     * 当前配置对应的摘要器。与抽取共用同一份模型配置——它对模型的要求比抽取更低
+     * （不要结构化输出、不要长推理），单开一组字段只会让「到底用哪个模型」变成两个答案。
+     *
+     * <p>客户端仍然分开建：prompt、温度、输入长度上限都不同，共用一个实例就要靠参数区分，
+     * 反而更容易串味。
+     */
+    public Summarizer summarizer() {
+        Snapshot s = snapshot;
+        String key = s.extractProvider() + "|" + s.extractBaseUrl() + "|" + s.extractModel()
+                + "|" + s.extractTimeoutMs() + "|" + s.extractApiKey();
+        Summarizer local = summarizer;
+        if (local != null && key.equals(summarizerKey)) {
+            return local;
+        }
+        synchronized (this) {
+            if (summarizer != null && key.equals(summarizerKey)) {
+                return summarizer;
+            }
+            Summarizer built = buildSummarizer(s);
+            this.summarizer = built;
+            this.summarizerKey = key;
+            return built;
+        }
+    }
+
+    private Summarizer buildSummarizer(Snapshot s) {
+        if (!s.extractIsHttp() || s.extractBaseUrl() == null || s.extractBaseUrl().isBlank()) {
+            // 摘要没有「硬切」之外的降级路线，所以这里不打 warn：没配模型是合法状态。
+            return new NoopSummarizer();
+        }
+        log.info("summarize: http model={} timeout={}ms base={}",
+                s.extractModel(), s.extractTimeoutMs(), s.extractBaseUrl());
+        return new HttpSummarizer(s.extractBaseUrl(), s.extractApiKey(), s.extractModel(),
+                s.extractTimeoutMs());
+    }
+
+    /** 表单渲染需要：字段元数据 + 当前值 + 基线 + 覆盖集合。 */    public Map<String, Object> describe() {
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("revision", revision);
         out.put("updatedAt", updatedAt == null ? null : updatedAt.toString());

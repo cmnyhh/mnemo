@@ -30,11 +30,13 @@ const probe = ref<EmbeddingProbe | null>(null)
 const rerankProbe = ref<RerankProbe | null>(null)
 
 const fields = computed<ConfigField[]>(() => data.value?.fields || [])
+const extractFields = computed(() => fields.value.filter((f) => f.group === 'extract'))
 const embeddingFields = computed(() => fields.value.filter((f) => f.group === 'embedding'))
 const searchFields = computed(() => fields.value.filter((f) => f.group === 'search'))
 const rerankFields = computed(() => fields.value.filter((f) => f.group === 'rerank'))
 const overridden = computed(() => new Set(data.value?.overridden || []))
 const requiresReindex = computed(() => Boolean(data.value?.space?.requiresReindex))
+const extractEnabled = computed(() => String(draft['extract.provider'] ?? '') === 'http')
 
 const bannerText = computed(() => {
   const space = data.value?.space
@@ -215,6 +217,31 @@ watch(
       </n-button>
     </div>
   </n-alert>
+
+  <n-card size="small" title="抽取模型" style="margin-bottom: 16px">
+    <div class="help" style="margin-bottom: 12px">
+      写入时由模型判断「这段该不该进记忆」，并抽成事实条目。不启用时按段硬切入库，
+      只剩形状过滤挡提示词模板与工具回显。
+    </div>
+
+    <n-form label-placement="top" :show-feedback="true">
+      <n-grid cols="1 760:2" :x-gap="20">
+        <n-grid-item v-for="field in extractFields" :key="field.key">
+          <config-input
+            :field="field"
+            :value="draft[field.key] ?? null"
+            :covered="overridden.has(field.key) || resets.has(field.key)"
+            @update:value="(v) => (draft[field.key] = v)"
+            @reset="resetField(field)"
+          />
+        </n-grid-item>
+      </n-grid>
+    </n-form>
+
+    <n-alert v-if="!extractEnabled" type="info" :bordered="false" style="margin-top: 4px">
+      当前未启用：写入不做准入判断，按段硬切入库。
+    </n-alert>
+  </n-card>
 
   <n-card size="small" title="嵌入模型" style="margin-bottom: 16px">
     <template #header-extra>

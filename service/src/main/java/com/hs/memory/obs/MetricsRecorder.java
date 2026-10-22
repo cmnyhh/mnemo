@@ -40,6 +40,7 @@ public class MetricsRecorder {
     public static final String RERANK = "mnemo.rerank";
     public static final String DEGRADE = "mnemo.degrade";
     public static final String REVIEW = "mnemo.ingest.review";
+    public static final String ADMISSION = "mnemo.ingest.admission";
 
     private final MeterRegistry registry;
     private final Map<String, Timer> timers = new ConcurrentHashMap<>();
@@ -60,12 +61,19 @@ public class MetricsRecorder {
         record(SEARCH_STAGE, nanos, "stage", stage);
     }
 
-    /** 一次写入的端到端耗时。{@code extraction} 是 llm-extract / episode-fallback / structured。 */
+    /**
+     * 一次写入的端到端耗时。
+     *
+     * <p>{@code extraction} 是这一轮走了哪条路：{@code llm-extract}（抽取+摘要）、
+     * {@code log-summary}（只摘了话，没抽事实）、{@code summary-fallback}（摘要模型不可用，
+     * 记了原文）、{@code episode-fallback}（摘要也不可用，按段硬切）、{@code structured}（调用方自抽）。
+     * 它同时回答了「记的是什么」和「花了谁的钱」。
+     */
     public void ingest(String extraction, String outcome, long nanos) {
         record(INGEST, nanos, "extraction", extraction, "outcome", outcome);
     }
 
-    /** 写入链路里某一段：extract / embed。 */
+    /** 写入链路里某一段：extract / summarize / embed。 */
     public void ingestStage(String stage, long nanos) {
         record(INGEST_STAGE, nanos, "stage", stage);
     }
@@ -84,6 +92,17 @@ public class MetricsRecorder {
         counter(REVIEW, "verdict", verdict).increment();
     }
 
+    /**
+     * 准入门：keep / reject / rules / error。
+     *
+     * <p>单独计数是因为它和 review 回答的是不同问题：review 是「这条内容有没有投毒嫌疑」，
+     * 准入是「这段内容该不该进记忆库」。reject 忽然变多，通常是上游把提示词或工具回显
+     * 当成对话发过来了，而不是模型变严格了。
+     */
+    public void admission(String verdict) {
+        counter(ADMISSION, "verdict", verdict).increment();
+    }
+
     // ------------------------------------------------------------------ 读
 
     /**
@@ -98,6 +117,7 @@ public class MetricsRecorder {
         out.put("rerank", counts(RERANK, "state"));
         out.put("degrade", counts(DEGRADE, "kind"));
         out.put("review", counts(REVIEW, "verdict"));
+        out.put("admission", counts(ADMISSION, "verdict"));
         out.put("scrapePath", "/internal/metrics");
         return out;
     }

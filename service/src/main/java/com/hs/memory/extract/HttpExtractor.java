@@ -1,5 +1,6 @@
 package com.hs.memory.extract;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.net.URI;
@@ -23,6 +24,13 @@ import java.util.Set;
 public class HttpExtractor implements Extractor {
 
     private static final Set<String> KINDS = Set.of("preference", "fact", "episode");
+
+    /**
+     * 「空结论」的形状：{@code {"items":[]}}，容忍模型在末尾多吐一个引号。
+     * 只认空数组，不认别的东西——这条捷径的边界必须是「意图明确到不用猜」。
+     */
+    private static final java.util.regex.Pattern EMPTY_ITEMS =
+            java.util.regex.Pattern.compile("\"items\"\\s*:\\s*\\[\\s*\\]");
 
     private final HttpClient http;
     private final ObjectMapper mapper = new ObjectMapper();
@@ -58,9 +66,20 @@ public class HttpExtractor implements Extractor {
         }
         long started = System.nanoTime();
         String content = call(text);
-        List<ExtractedItem> items = parse(content);
+        Parsed parsed = parse(content);
         int latency = (int) ((System.nanoTime() - started) / 1_000_000);
-        return new ExtractResult(items, model, latency, false);
+        if (!parsed.admitted()) {
+            // 准入被拒：这段内容不该进长期记忆（提示词模板/工具回显/闲聊…）。
+            // 与「抽到 0 条」分开返回，否则排障时分不清是抽取太保守还是上游发错了东西。
+            // 摘要照样带出来：被拒的是「抽取」，不是「记录」。
+            return ExtractResult.rejected(model, latency, parsed.reason(), parsed.summary());
+        }
+        return new ExtractResult(parsed.items(), model, latency, false, true, parsed.reason(),
+                parsed.summary());
+    }
+
+    /** 一次模型调用同时给三件事：准入门结论、抽到的条目、这一轮聊了什么的记录。 */
+    record Parsed(List<ExtractedItem> items, boolean admitted, String reason, String summary) {
     }
 
     @Override
@@ -106,13 +125,46 @@ public class HttpExtractor implements Extractor {
         }
     }
 
-    List<ExtractedItem> parse(String content) {
-        String json = extractJsonObject(content);
-        JsonNode root;
+    Parsed parse(String content) {
+        JsonNode root = null;
+        ExtractException failure = null;
         try {
-            root = mapper.readTree(json);
-        } catch (Exception e) {
-            throw new ExtractException("抽取输出不是合法 JSON: " + abbreviate(content, 160), e);
+            root = mapper.readTree(extractJsonObject(content));
+        } catch (ExtractException | JsonProcessingException e) {
+            failure = e instanceof ExtractException ee ? ee
+                    : new ExtractException("抽取输出不是合法 JSON: " + abbreviate(content, 160), e);
+            // GLM-4-9B 有个固定毛病：在收尾处多吐一个引号（`..."items":[]"}`），
+            // 括号配对因此永远不闭合。这类畸形只差一个字符，值得修一次再判失败——
+            // 因为**失败会把整轮提示词写进记忆**（回落硬切），代价远大于一次重试解析。
+            String repaired = repairJson(content);
+            if (repaired != null) {
+                try {
+                    root = mapper.readTree(repaired);
+                    failure = null;
+                } catch (Exception ignored) {
+                    // 修不好就还是失败，下面的空结论兜底与抛出逻辑照旧
+                }
+            }
+        }
+        if (root == null) {
+            // 最后一道：内容里明确写了 items 是空数组，就当「这轮没什么可记的」。
+            // 空结论被当成格式错误，正是线上杂音的主要来源。
+            if (EMPTY_ITEMS.matcher(content).find()) {
+                return new Parsed(List.of(), true, "模型判定这轮没有值得记的内容", null);
+            }
+            throw failure;
+        }
+        String reason = text(root, "reason");
+        // 缺省放行：提示词是随版本走的，旧模型/旧缓存里没有 admit 字段时
+        // 不能因为「没写」就整条链路突然什么都不记。
+        boolean admitted = !root.has("admit") || root.path("admit").asBoolean(true);
+        // 摘要与准入无关：admit=false 的轮次也要记「聊了什么」。
+        // 上限跟摘要器保持一致，否则同一份提示词走两条路会出现两种长度。
+        String summary = abbreviate(text(root, "summary"), HttpSummarizer.MAX_SUMMARY_CHARS);
+        if (!admitted) {
+            return new Parsed(List.of(), false,
+                    reason.isEmpty() ? "模型判定不值得进长期记忆" : abbreviate(reason, 120),
+                    summary.isEmpty() ? null : summary);
         }
         JsonNode arr = root.path("items");
         if (!arr.isArray()) {
@@ -129,7 +181,8 @@ public class HttpExtractor implements Extractor {
                 out.add(item);
             }
         }
-        return List.copyOf(out);
+        return new Parsed(List.copyOf(out), true, reason.isEmpty() ? null : abbreviate(reason, 120),
+                summary.isEmpty() ? null : summary);
     }
 
     private ExtractedItem toItem(JsonNode node) {
@@ -198,6 +251,30 @@ public class HttpExtractor implements Extractor {
     private static String text(JsonNode node, String field) {
         JsonNode v = node.path(field);
         return v.isTextual() ? v.asText().trim() : (v.isNumber() ? v.asText() : "");
+    }
+
+    /**
+     * 针对「只差一个字符」的畸形做一次修复，修不好返回 {@code null}。
+     *
+     * <p>只处理两类**形状确定**的毛病，不做任何语义猜测：
+     * <ol>
+     *   <li>收尾多一个引号：{@code ..."items":[]"}} → {@code ..."items":[]}}；</li>
+     *   <li>对象后面又跟了一个引号或说明文字：截到最后一个 {@code }} 为止。</li>
+     * </ol>
+     * 修完之后仍然要过一遍真正的 JSON 解析，解析不过就是真的坏，照旧抛。
+     */
+    static String repairJson(String content) {
+        if (content == null) {
+            return null;
+        }
+        String s = content.trim();
+        s = s.replaceAll("\\]\"\\s*\\}", "]}").replaceAll("\\}\"\\s*\\}", "}}");
+        int start = s.indexOf('{');
+        int end = s.lastIndexOf('}');
+        if (start < 0 || end <= start) {
+            return null;
+        }
+        return s.substring(start, end + 1);
     }
 
     /**

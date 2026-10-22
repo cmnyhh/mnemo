@@ -21,3 +21,5 @@ node_modules/
 
 # 评测产物
 bench/locomo/out/
+__pycache__/
+*.pyc
