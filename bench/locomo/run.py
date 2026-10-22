@@ -75,6 +75,55 @@ def http_json(url: str, body: dict | None, token: str | None, timeout: int = 120
         return json.loads(resp.read().decode())
 
 
+# ---------------------------------------------------------------- 查询扩展
+
+# 这段提示是全套实验里最容易做砸的地方：裸提示会让 7B 直接「猜答案」
+# （问 destress 吐 reads books drinks tea），猜错等于把检索带向错误的语义区域。
+# 只允许泛化类别词，禁止具体活动 / 物件 / 日期 / 数字。
+REWRITE_SYSTEM = (
+    "Output 8 general topic words or short phrases that a chat about this question would "
+    "contain: keep every name and place from the question, then add CATEGORIES (e.g. hobbies, "
+    "exercise, art, socializing) for whatever is being asked about. Rules: never answer the "
+    "question; never name a specific activity, object, place, date or number that is not in "
+    "the question; never guess a fact. One line, comma separated, no quotes."
+)
+
+# 显式时间锚点不扩展：加泛化词会把 "4 years ago" 这类唯一线索稀释掉（实测 #92→#129）。
+TEMPORAL = re.compile(r"\b(when|how many|how long|years? ago|months? ago|19\d\d|20\d\d)\b", re.I)
+
+_REWRITE_CACHE: dict[str, str] = {}
+_REWRITE_FAILS = [0]
+
+
+def expand_query(q: str, args) -> str:
+    """返回扩展词；失败返回空串（调用方退回原查询）。"""
+    if q in _REWRITE_CACHE:
+        return _REWRITE_CACHE[q]
+    if getattr(args, "rewrite_gate", False) and TEMPORAL.search(q):
+        _REWRITE_CACHE[q] = ""
+        return ""
+    try:
+        resp = http_json(args.rewrite_base.rstrip("/") + "/chat/completions", {
+            "model": args.rewrite_model,
+            "temperature": 0,
+            "max_tokens": 120,
+            "messages": [
+                {"role": "system", "content": REWRITE_SYSTEM},
+                {"role": "user", "content": q},
+            ],
+        }, args.rewrite_key, timeout=args.rewrite_timeout)
+        text = ((resp.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+        line = text.strip().splitlines()[0] if text.strip() else ""
+        parts = [p.strip() for p in re.split(r"[,;]", line) if p.strip()]
+        parts = [p for p in parts if not re.search(r"\d", p)]
+        out = ", ".join(parts)[:200]
+    except Exception:
+        _REWRITE_FAILS[0] += 1
+        out = ""
+    _REWRITE_CACHE[q] = out
+    return out
+
+
 def sessions_of(conv: dict) -> list[tuple[int, str, list[dict]]]:
     """返回 [(会话序号, 日期, 轮次列表)]，按序号排序。"""
     out = []
@@ -198,9 +247,11 @@ def do_ask(args) -> None:
 
     def one(q: dict) -> dict:
         started = time.time()
+        expanded = expand_query(q["question"], args) if args.rewrite_base else ""
+        query = expanded or q["question"]
         try:
             resp = http_json(args.base + "/v1/memory/search",
-                             {"query": q["question"], "topK": args.topk},
+                             {"query": query, "topK": args.topk},
                              token_for(q["sample"], args.token))
         except Exception as e:
             return {**q, "error": str(e), "hits": 0}
@@ -211,6 +262,9 @@ def do_ask(args) -> None:
         injection = resp.get("injection") or ""
         return {
             **q,
+            # 审计用：改写实际发出去的查询。judge 仍按原问句判分，不受影响。
+            "expandedQuery": expanded,
+            "queryUsed": query,
             "elapsedMs": resp.get("elapsedMs"),
             "abstained": resp.get("abstained"),
             "route": resp.get("route"),
@@ -235,6 +289,84 @@ def do_ask(args) -> None:
     with out.open("a") as fh:
         for row in lock_rows:
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    print(f"wrote {out}")
+
+
+# ---------------------------------------------------------------- probe
+
+def miss_sessions(row: dict) -> set[str]:
+    """这一题里「整段会话一条都没召回」的那些会话。
+
+    会话靠 dia_id 的前缀区分（D1:3 -> D1）。判据是：某条证据所在的会话，
+    在 retrieved 里一个 dia_id 都没有——这正是邻域回填救不了的那批，
+    因为回填要从已命中的条目出发，没有锚点就无从下手。
+    """
+    ev = [p.strip() for e in (row.get("evidence") or []) for p in e.split(";") if p.strip()]
+    got = set(row.get("retrieved") or [])
+    missing = {e.split(":")[0] for e in ev if e not in got}
+    covered = {g.split(":")[0] for g in got}
+    return missing - covered
+
+
+def do_probe(args) -> None:
+    """深度探针：只检索、不作答，用来区分「表示不行」和「排得靠后」。
+
+    做法是把 topK 放宽再查同一个 query，看零命中会话里的证据轮能不能进榜、排第几、
+    向量分多少。这一步不调 LLM，所以比 ask 快两个量级，但能一次性说明：
+    加深度到底能不能救回那批，还是必须换检索表示（话题簇）才行。
+
+    只探基线里零命中的题（--baseline 给 ask.jsonl），全量跑既慢又没必要。
+    """
+    questions = load_questions(Path(args.data))
+    ids = None
+    if args.baseline:
+        rows = [json.loads(l) for l in Path(args.baseline).read_text().splitlines() if l.strip()]
+        ids = {r["id"] for r in rows if miss_sessions(r)}
+        print(f"probe: 基线里零命中会话的题 {len(ids)} 道", flush=True)
+    picked = [q for q in questions if ids is None or q["id"] in ids]
+    if args.limit:
+        picked = picked[: args.limit]
+
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    print(f"probe: {len(picked)} 道，topK={args.topk}，并发 {args.concurrency}", flush=True)
+
+    def one(q: dict) -> dict:
+        try:
+            resp = http_json(args.base + "/v1/memory/search",
+                             {"query": q["question"], "topK": args.topk},
+                             token_for(q["sample"], args.token))
+        except Exception as e:
+            return {"id": q["id"], "error": str(e)[:200]}
+        hits = resp.get("hits") or []
+        inj = resp.get("injection") or ""
+        return {
+            "id": q["id"], "sample": q["sample"], "category": q["category"],
+            "question": q["question"], "evidence": q["evidence"],
+            "abstained": resp.get("abstained"), "rerank": resp.get("rerank"),
+            "route": resp.get("route"), "elapsedMs": resp.get("elapsedMs"),
+            "injectionLen": len(inj),
+            # 邻居行数：注入块里带〔相邻轮次〕标记的条数，用来量回填有没有被预算丢掉
+            "neighbors": inj.count("〔相邻轮次〕"),
+            "hits": [{
+                "dia": DIA.findall(h.get("narrative") or ""),
+                "score": h.get("score"), "rrf": h.get("rrf"),
+                "dense": h.get("denseScore"), "rel": h.get("rerankScore"),
+                "bm25Rank": h.get("bm25Rank"), "denseRank": h.get("denseRank"),
+                "tier": h.get("tier"),
+            } for h in hits],
+        }
+
+    t0 = time.time()
+    done = 0
+    with out.open("w") as fh, ThreadPoolExecutor(max_workers=args.concurrency) as pool:
+        futures = [pool.submit(one, q) for q in picked]
+        for fut in as_completed(futures):
+            fh.write(json.dumps(fut.result(), ensure_ascii=False) + "\n")
+            fh.flush()
+            done += 1
+            if done % 50 == 0 or done == len(picked):
+                print(f"  {done}/{len(picked)}  {done / max(1e-6, time.time() - t0):.1f} q/s", flush=True)
     print(f"wrote {out}")
 
 
@@ -422,7 +554,7 @@ def do_report(args) -> None:
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("stage", choices=["ingest", "ask", "judge", "report"])
+    p.add_argument("stage", choices=["ingest", "ask", "probe", "judge", "report"])
     p.add_argument("--data", default="/tmp/locomo10.json")
     p.add_argument("--base", default=os.environ.get("MNEMO_BASE", "http://127.0.0.1:8090"))
     p.add_argument("--token", default=os.environ.get("MNEMO_TOKEN", ""))
@@ -437,14 +569,28 @@ def main() -> None:
     p.add_argument("--concurrency", type=int, default=2)
     p.add_argument("--max-context", type=int, default=6000)
     p.add_argument("--granularity", choices=["turn", "session"], default="turn")
+    # probe 专用：拿基线结果筛出「零命中会话」的题，只探那批。
+    p.add_argument("--baseline", default="", help="probe 用：基线 ask.jsonl 路径")
+    # ask 专用：查询扩展。留空 = 不改写，行为与历史完全一致。
+    p.add_argument("--rewrite-base", default=os.environ.get("REWRITE_BASE", ""),
+                   help="改写的 OpenAI 兼容端点；留空则关闭")
+    p.add_argument("--rewrite-key", default=os.environ.get("REWRITE_KEY", ""))
+    p.add_argument("--rewrite-model", default=os.environ.get("REWRITE_MODEL", "Qwen/Qwen2.5-7B-Instruct"))
+    p.add_argument("--rewrite-timeout", type=int, default=20, help="改写超时（秒）")
+    p.add_argument("--rewrite-gate", action="store_true",
+                   help="时间类问句（when / years ago / 年份）不扩展")
     p.add_argument("--llm-base", default=os.environ.get("BENCH_LLM_BASE", ""))
     p.add_argument("--llm-key", default=os.environ.get("BENCH_LLM_KEY", ""))
     p.add_argument("--model", default=os.environ.get("BENCH_LLM_MODEL", ""))
     p.add_argument("--judge-model", default=os.environ.get("BENCH_JUDGE_MODEL", ""))
     args = p.parse_args()
+    # probe 的产物不能落到 ask.jsonl 上——那会把基线覆盖掉，后面没法对照。
+    if args.stage == "probe" and args.out == "bench/locomo/out/ask.jsonl":
+        args.out = "bench/locomo/out/probe.jsonl"
     load_tokens(args.tokens)
 
-    {"ingest": do_ingest, "ask": do_ask, "judge": do_judge, "report": do_report}[args.stage](args)
+    {"ingest": do_ingest, "ask": do_ask, "probe": do_probe,
+     "judge": do_judge, "report": do_report}[args.stage](args)
 
 
 if __name__ == "__main__":
