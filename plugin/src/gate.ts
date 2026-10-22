@@ -1,23 +1,30 @@
 /**
- * Write gate: decide whether a finished turn is worth remembering.
+ * Write gate: decide what a finished turn contributes to memory.
  *
- * Extracting every turn costs more model calls than the conversation itself and
- * mostly produces noise — small talk, acknowledgements, restatements. The records
- * that matter cluster around two events: something changed, and something broke
- * and was fixed. Everything else can go unremembered without anyone noticing.
+ * Two different things can be produced from one turn, and they have opposite
+ * economics:
  *
- * The gate is deliberately **client-side**: the plugin is the only component that
- * sees the turn, and a service-side gate would have to be paid for on every path
- * that writes. Its judgement is textual on purpose — the plugin's contract is the
- * conversation, not the tool log, and a keyword heuristic that errs toward
- * "don't write" is the right failure direction: recall quality does not depend on
- * capturing every turn, but it does degrade under a flood of trivial ones.
+ * - **A conversation log entry** — who said what in this turn. Cheap (no model
+ *   call), complete, and the thing that answers "what did we talk about". Its
+ *   value comes from coverage, so the gate lets it through by default.
+ * - **Extracted facts / preferences** — what is durably true. Expensive (one
+ *   model call per turn) and worthless if it fires on small talk, so it stays
+ *   behind the keyword signals.
+ *
+ * `mode: 'log'` (the default) captures every turn and reports the signal in
+ * `trigger`; the service writes the log entry unconditionally and only spends a
+ * model call when the trigger says something happened. `mode: 'signal'` is the
+ * old behaviour — nothing is sent unless a signal fired — and exists for hosts
+ * that want strict filtering.
  *
  * @module @deepseek-ai/dsh-memory-core/gate
  */
 
-/** Why a turn passed the gate. `none` means it did not. */
+/** Why a turn carries a signal worth spending extraction on. `none` means "log only". */
 export type Trigger = 'explicit' | 'change' | 'repair' | 'none'
+
+/** `log` records every turn; `signal` records only turns with a trigger. */
+export type CaptureMode = 'log' | 'signal'
 
 export interface GateInput {
   /** What the person typed. */
@@ -34,6 +41,8 @@ export interface GateOptions {
    * (default 24). Acknowledgements and one-liners carry no state worth keeping.
    */
   readonly minChars?: number
+  /** `log` (default) records every turn; `signal` only records triggered turns. */
+  readonly mode?: CaptureMode
 }
 
 export interface GateDecision {
@@ -59,30 +68,46 @@ function join(input: GateInput): string {
   return [input.prompt, ...input.replies].join('\n').trim()
 }
 
+/** The signal, independent of whether the turn is captured. */
+function signalOf(input: GateInput): Trigger {
+  if (EXPLICIT.test(input.prompt)) return 'explicit'
+  const replies = input.replies.join('\n')
+  if (PROBLEM.test(input.prompt) && FIXED.test(replies)) return 'repair'
+  if (CHANGE.test(replies) || CHANGE.test(input.prompt)) return 'change'
+  return 'none'
+}
+
 export function decideCapture(input: GateInput, options: GateOptions = {}): GateDecision {
   if (options.enabled === false) {
-    return { capture: true, trigger: 'none', reason: '闸门已关闭，全部写入' }
+    // 关掉闸门＝每轮都按「有信号」处理：记日志，也照常抽事实。
+    // 这里不能报 explicit——那会让服务端跳过形状过滤，等于把所有注入块都收进来。
+    return { capture: true, trigger: 'change', reason: '闸门已关闭，全部写入' }
   }
   const minChars = options.minChars ?? 24
+  const mode: CaptureMode = options.mode ?? 'log'
+  const text = join(input)
+  if (text.length === 0) {
+    return { capture: false, trigger: 'none', reason: '空轮，无可写入内容' }
+  }
+
+  const trigger = signalOf(input)
 
   // 显式优先于长度：一句「记住：端口是 8080」很短，但正是最该留的那种。
-  if (EXPLICIT.test(input.prompt)) {
-    return { capture: true, trigger: 'explicit', reason: '用户显式要求记住' }
+  if (trigger === 'explicit') {
+    return { capture: true, trigger, reason: '用户显式要求记住' }
   }
 
-  const text = join(input)
-  const replies = input.replies.join('\n')
   // 「端口改成 9090」只有九个字，但它是本轮最值得记的东西。
-  // 所以长度只用来过滤「没有任何信号」的短轮，不用来否决有信号的短轮。
-  if (text.length < minChars && !CHANGE.test(text)) {
-    return { capture: false, trigger: 'none', reason: `内容过短（${String(text.length)} 字）且无变更信号，不抽取` }
+  // 所以长度只用来挡「没有任何信号」的短轮，不用来否决有信号的短轮。
+  if (text.length < minChars && trigger === 'none') {
+    return { capture: false, trigger, reason: `内容过短（${String(text.length)} 字）且无变更信号，不记` }
   }
 
-  if (PROBLEM.test(input.prompt) && FIXED.test(replies)) {
-    return { capture: true, trigger: 'repair', reason: '先失败后解决，值得记成 episode' }
+  if (mode === 'signal' && trigger === 'none') {
+    return { capture: false, trigger, reason: '既非显式、也非变更或修复，不记' }
   }
-  if (CHANGE.test(replies) || CHANGE.test(input.prompt)) {
-    return { capture: true, trigger: 'change', reason: '本轮发生了变更' }
+  if (trigger === 'none') {
+    return { capture: true, trigger, reason: '记对话日志（不抽事实）' }
   }
-  return { capture: false, trigger: 'none', reason: '既非显式、也非变更或修复，不抽取' }
+  return { capture: true, trigger, reason: '本轮有信号，记日志并抽事实' }
 }

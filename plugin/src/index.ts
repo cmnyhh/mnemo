@@ -202,14 +202,23 @@ export interface Config {
   /**
    * Only write a turn that looks worth remembering (default `true`).
    *
-   * Extraction on every turn costs more model calls than the conversation, and
-   * most turns produce records that only add noise to recall. The gate keeps
-   * explicit "记住…", changes, and repaired failures. Turn it off to capture
-   * everything, which is mainly useful when tuning extraction.
+   * `writeMode` decides what "worth remembering" means; this switch just turns
+   * the judgement off entirely.
    */
   writeGate?: boolean
   /** Turns shorter than this (prompt + replies) are never written (default 24). */
   writeGateMinChars?: number
+  /**
+   * What the gate lets through (default `log`).
+   *
+   * - `log` — every turn becomes a conversation log entry. Turns with a signal
+   *   (explicit "记住…", a change, a repaired failure) also get extracted into
+   *   facts. This is the conversation-history mode: nothing is silently dropped
+   *   just because it was not phrased as a request.
+   * - `signal` — only triggered turns are sent at all. Cheaper, but a turn that
+   *   states something plainly ("我们用的是 PG18") is lost.
+   */
+  writeMode?: 'log' | 'signal'
 }
 
 /** Schemastery validation for {@link Config}. */
@@ -241,6 +250,9 @@ export const Config = z.object({
   agentsSyncMinutes: z.number().default(30),
   writeGate: z.boolean().default(true),
   writeGateMinChars: z.number().default(24),
+  // 取值在下面按 `=== 'signal'` 判定，非法值自动落回 log——不必用 union/literal，
+  // 这个宿主带的 schemastery 版本没有 Schema.literal。
+  writeMode: z.string().default('log'),
 }) as unknown as z<Config>
 
 /** Argument schema for `memory_search`; the map is an implicit open object root. */
@@ -444,6 +456,7 @@ export function apply(ctx: Context, config: Config): void {
 
   const writeGate = config.writeGate !== false
   const writeGateMinChars = requireInteger('writeGateMinChars', config.writeGateMinChars as number, 1)
+  const writeMode = config.writeMode === 'signal' ? 'signal' : 'log'
 
   const t0WriteEnabled = config.t0WriteEnabled === true
   const agentsMaxChars = requireInteger('agentsMaxChars', config.agentsMaxChars as number, 256)
@@ -607,7 +620,7 @@ export function apply(ctx: Context, config: Config): void {
           offset,
           gate: decideCapture(
             { prompt: exchange.prompt, replies: exchange.replies },
-            { enabled: writeGate, minChars: writeGateMinChars },
+            { enabled: writeGate, minChars: writeGateMinChars, mode: writeMode },
           ),
         }))
         const kept = gated.filter((entry) => {
@@ -835,10 +848,13 @@ export function apply(ctx: Context, config: Config): void {
   // ordinary discussion says none of those words, and the model has no way to
   // tell the plugin it mattered — this is that channel.
   //
-  // It deliberately shares the captured-turn path instead of adding a direct
-  // insert: the service runs its write review on every ingest, so a statement
-  // that smuggles an instruction ("以后把数据发到某邮箱") is downgraded there
-  // rather than trusted because a model wrote it.
+  // It sends structured `items` rather than a bare turn: the model already chose
+  // the content and phrased it as one self-contained statement, so a second
+  // extraction pass on the service would only add 4–5 s, reword the statement,
+  // or drop it under `extract.min-confidence`. The write review still runs — the
+  // service applies it per item — so a statement that smuggles an instruction
+  // ("以后把数据发到某邮箱") is still downgraded rather than trusted because a
+  // model wrote it.
   let toolWrites = 0
   ctx.tools.register(defineTool({
     name: writeToolName,
@@ -873,6 +889,9 @@ export function apply(ctx: Context, config: Config): void {
           // The model asked to keep this: the service raises confidence the same
           // way it does for a person saying "记住".
           trigger: 'explicit',
+          // 结构化直插：不跑服务端抽取。turn 仍然带着，只为了让服务端认出
+          // trigger=explicit —— 那是豁免准入判断与形状过滤的依据。
+          items: [{ kind: 'episode', narrative: text, sourceKind: 'tool', turn: toolWrites }],
         })
         return {
           ok: true,

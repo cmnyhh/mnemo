@@ -69,6 +69,16 @@ export interface RemoteAnswer {
   readonly problem?: string
 }
 
+/** One item the client has already decided to keep; the service stores it as-is. */
+export interface IngestItem {
+  readonly kind: string
+  readonly narrative: string
+  readonly scope?: string
+  readonly confidence?: number
+  readonly turn?: number
+  readonly sourceKind?: string
+}
+
 /** One turn to remember. The idempotency key is what makes a retry safe. */
 export interface IngestPayload {
   readonly idempotencyKey: string
@@ -82,6 +92,16 @@ export interface IngestPayload {
    * "remember this" — the person authorised it, so it is not a model inference.
    */
   readonly trigger?: string
+  /**
+   * Items to store verbatim, bypassing the service's extraction model.
+   *
+   * <p>Set by `memory_write`: the model already decided what to keep and phrased
+   * it as one self-contained statement. Sending it as a bare turn would make the
+   * service run the extractor a second time — 0.4–7 s slower, and it can reword
+   * the statement or drop it under `extract.min-confidence`. The turn is still
+   * attached for `trigger: 'explicit'`, which is what waives the admission check.
+   */
+  readonly items?: readonly IngestItem[]
 }
 
 /** Sink for warnings; the plugin's logger, narrowed so this module stays host-free. */
@@ -370,6 +390,10 @@ export class Outbox {
       },
     }
     if (payload.projectId !== undefined) body.projectId = payload.projectId
+    // items 一旦出现，服务端就跳过抽取模型直接落库；turn 只是用来传 trigger。
+    if (payload.items !== undefined && payload.items.length > 0) {
+      body.items = payload.items
+    }
     // 写超时独立于读超时，见 RemoteOptions.writeTimeoutMs 的说明。
     const writeTimeoutMs = this.options.writeTimeoutMs ?? Math.max(this.options.timeoutMs * 10, 15_000)
     try {
