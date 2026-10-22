@@ -55,6 +55,9 @@ public final class Ranking {
         double tau = switch (kind == null ? "" : kind) {
             case "preference" -> 365.0;
             case "fact" -> 180.0;
+            // 对话日志每轮一条，量级和事实不是一个数量级：半衰期必须短，否则
+            // 上周聊过的每一轮都在和今天的事实抢注入预算。
+            case "episode" -> 14.0;
             default -> 60.0;
         };
         return Math.exp(-Math.log(2) * days / tau);
