@@ -34,7 +34,12 @@ public record IngestRequest(
             String trustLevel,
             String projectId,
             String validFrom,
-            String sourceKind
+            String sourceKind,
+            /**
+             * 这条记忆属于会话里的第几轮。用它才能在检索时把「同一段对话的前后几句」找回来；
+             * 只在 {@code items} 里按条写入时需要显式给，走 {@code turn} 的路径由服务端填。
+             */
+            Integer turn
     ) {
     }
 

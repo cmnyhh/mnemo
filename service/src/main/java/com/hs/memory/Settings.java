@@ -28,6 +28,10 @@ public record Settings(
         double abstainThreshold,
         int injectionBudgetChars,
         double denseMinScore,
+        // 邻域扩展：命中一条之后，把它同会话的前后几轮也一起给模型。
+        // 0 = 关闭。半径 1 只带前后各一轮，够补指代，又不会让注入块翻倍。
+        int neighborRadius,
+        int neighborMax,
         String rerankProvider,
         String rerankBaseUrl,
         String rerankApiKey,

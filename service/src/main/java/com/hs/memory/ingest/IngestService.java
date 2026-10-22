@@ -208,7 +208,7 @@ public class IngestService {
             out.add(new IngestRequest.Item(
                     e.kind(), null, null, e.narrative(), facts, e.recallHints(),
                     e.subjectKey(), e.predicate(), e.objectValue(),
-                    null, e.confidence(), null, null, null, "turn"));
+                    null, e.confidence(), null, null, null, "turn", null));
         }
         return out;
     }
@@ -408,7 +408,8 @@ public class IngestService {
         if (sessionId == null && req.turn() != null) {
             sessionId = blankToNull(req.turn().sessionId());
         }
-        Integer turnIndex = req.turn() == null ? null : req.turn().index();
+        Integer turnIndex = item.turn() != null ? item.turn()
+                : (req.turn() == null ? null : req.turn().index());
 
         return new Prepared(new NewItem(UUID.randomUUID(), tenantId, tokenId, userId, projectId, scope, kind, tier,
                 trust, subject, predicate, objectValue, factsJson, narrative,
@@ -446,7 +447,7 @@ public class IngestService {
                 return out;
             }
             out.add(new IngestRequest.Item("episode", "project", null, segment, Map.of(),
-                    null, null, null, null, 0.5, 0.7, "medium", null, null, "turn"));
+                    null, null, null, null, 0.5, 0.7, "medium", null, null, "turn", null));
         }
     }
     if (out.isEmpty()) {

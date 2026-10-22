@@ -212,19 +212,57 @@ public final class Ranking {
             return "";
         }
         int itemMax = itemBudget(budgetChars);
-        StringBuilder sb = new StringBuilder(header);
-        int headerLen = sb.length();
-        for (InjectionEntry e : entries) {
-            String line = "- [" + e.kind() + "·" + e.tier() + "·" + String.format("%.2f", e.score()) + "] "
-                    + untrusted(e.trust()) + smartTrim(e.narrative(), itemMax, query)
-                    + captions(e.assetCaptions()) + "\n";
-            if (sb.length() + line.length() > budgetChars) {
-                break;
-            }
-            sb.append(line);
+        boolean[] alive = new boolean[entries.size()];
+        String[] lines = new String[entries.size()];
+        // 预算要把信封算进去，否则「1200 字的块」实际会输出 1350 字——信封是固定开销，
+        // 不计入就等于每次偷偷超支一百多字。
+        int total = header.length() + CONTEXT_OPEN.length() + CONTEXT_NOTE.length()
+                + CONTEXT_CLOSE.length() + 3;
+        for (int i = 0; i < entries.size(); i++) {
+            InjectionEntry e = entries.get(i);
+            lines[i] = line(e, itemMax, query);
+            alive[i] = true;
+            total += lines[i].length();
         }
-        return sb.length() <= headerLen ? "" : wrap(sb.toString());
+        // 超预算时的让位顺序：**先丢上下文，再丢靠后的命中条目**。
+        // 邻居是「帮模型读懂命中」的，不能反过来把真正的命中挤出去。
+        for (int i = entries.size() - 1; i >= 0 && total > budgetChars; i--) {
+            if (alive[i] && entries.get(i).context()) {
+                alive[i] = false;
+                total -= lines[i].length();
+            }
+        }
+        for (int i = entries.size() - 1; i >= 0 && total > budgetChars; i--) {
+            if (alive[i]) {
+                alive[i] = false;
+                total -= lines[i].length();
+            }
+        }
+        StringBuilder sb = new StringBuilder(header);
+        for (int i = 0; i < entries.size(); i++) {
+            if (alive[i]) {
+                sb.append(lines[i]);
+            }
+        }
+        return sb.length() <= header.length() ? "" : wrap(sb.toString());
     }
+
+    /** 单行渲染。上下文行不显示分数：那个分数属于它跟着的那条命中，写成自己的会误导。 */
+    private static String line(InjectionEntry e, int itemMax, String query) {
+        if (e.context()) {
+            return "- " + NEIGHBOR_MARK
+                    + smartTrim(e.narrative(), Math.min(itemMax, NEIGHBOR_ITEM_MAX), query) + "\n";
+        }
+        return "- [" + e.kind() + "·" + e.tier() + "·" + String.format("%.2f", e.score()) + "] "
+                + untrusted(e.trust()) + smartTrim(e.narrative(), itemMax, query)
+                + captions(e.assetCaptions()) + "\n";
+    }
+
+    /** 邻域回填行的标记。写「相邻轮次」而不是「上下文」，是为了让模型知道这是同一段对话的别处。 */
+    static final String NEIGHBOR_MARK = "〔相邻轮次〕";
+
+    /** 邻居单条上限。它只负责补齐前因后果，不该比命中条目占更多地方。 */
+    private static final int NEIGHBOR_ITEM_MAX = 700;
 
     /**
      * 单条能用多少字。
@@ -471,15 +509,26 @@ public final class Ranking {
     }
 
     public record InjectionEntry(String kind, String tier, double score, String narrative,
-                                 String trust, List<String> assetCaptions) {
+                                 String trust, List<String> assetCaptions, boolean context) {
+
         /** 没有附件、也不特别标注来源的常见情形。 */
         public InjectionEntry(String kind, String tier, double score, String narrative) {
-            this(kind, tier, score, narrative, com.hs.memory.guard.TrustPolicy.MEDIUM, List.of());
+            this(kind, tier, score, narrative, com.hs.memory.guard.TrustPolicy.MEDIUM, List.of(), false);
         }
 
         public InjectionEntry(String kind, String tier, double score, String narrative,
                               List<String> assetCaptions) {
-            this(kind, tier, score, narrative, com.hs.memory.guard.TrustPolicy.MEDIUM, assetCaptions);
+            this(kind, tier, score, narrative, com.hs.memory.guard.TrustPolicy.MEDIUM, assetCaptions, false);
+        }
+
+        public InjectionEntry(String kind, String tier, double score, String narrative,
+                              String trust, List<String> assetCaptions) {
+            this(kind, tier, score, narrative, trust, assetCaptions, false);
+        }
+
+        /** 邻域回填的「上下文」条目：紧跟在命中的那条后面，不显示分数（分数属于它跟着的那条）。 */
+        public static InjectionEntry neighbour(String tier, String narrative, String trust) {
+            return new InjectionEntry("上下文", tier, 0, narrative, trust, List.of(), true);
         }
     }
 }

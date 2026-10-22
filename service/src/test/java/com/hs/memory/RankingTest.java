@@ -218,4 +218,30 @@ class RankingTest {
         assertThat(block).contains("First sentence here");
         assertThat(block).contains("…");
     }
+
+    @Test
+    void neighbourLinesCarryTheirOwnMarkerAndNoScore() {
+        // 邻域回填的行不显示分数：那个分数属于它跟着的命中，写成自己的会让人以为它也命中了。
+        String block = Ranking.renderInjection(List.of(
+                new Ranking.InjectionEntry("episode", "T2", 0.81, "Carol: I adopted a child last year."),
+                Ranking.InjectionEntry.neighbour("T2", "Mel: That is wonderful news!", "medium")),
+                8000, "adopted");
+        assertThat(block).contains("〔相邻轮次〕Mel: That is wonderful news!");
+        assertThat(block).contains("[episode·T2·0.81]");
+        assertThat(block).doesNotContain("0.00");
+    }
+
+    @Test
+    void neighbourLinesAreDroppedBeforeAnyRealHit() {
+        // 预算紧张时先牺牲上下文：邻居是帮模型读懂命中的，不能反过来把命中挤出去。
+        List<Ranking.InjectionEntry> entries = new java.util.ArrayList<>();
+        for (int i = 0; i < 4; i++) {
+            entries.add(new Ranking.InjectionEntry("episode", "T2", 0.9 - i * 0.05,
+                    "hit " + i + " " + "x".repeat(150)));
+            entries.add(Ranking.InjectionEntry.neighbour("T2", "neighbour " + i + " " + "y".repeat(150), "medium"));
+        }
+        String block = Ranking.renderInjection(entries, 950, "hit");
+        assertThat(block).contains("hit 0").contains("hit 3");
+        assertThat(block).doesNotContain("neighbour");
+    }
 }

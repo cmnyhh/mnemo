@@ -144,7 +144,7 @@ public class AssetService {
         }
         IngestRequest.Item item = new IngestRequest.Item(
                 "episode", "project", null, narrative, facts, List.copyOf(hints),
-                null, null, null, CAPTION_IMPORTANCE, 0.8, "high", null, null, "tool");
+                null, null, null, CAPTION_IMPORTANCE, 0.8, "high", null, null, "tool", null);
         IngestResponse resp = ingest.ingest(tenantId, tokenId, new IngestRequest(
                 "asset:" + sha256, null, projectId, null, List.of(item), null));
         if (resp.items() == null || resp.items().isEmpty()) {

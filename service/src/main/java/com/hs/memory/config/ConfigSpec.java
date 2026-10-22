@@ -33,6 +33,8 @@ public final class ConfigSpec {
     public static final String ABSTAIN_THRESHOLD = "search.abstain-threshold";
     public static final String INJECTION_BUDGET = "search.injection-budget";
     public static final String DENSE_MIN_SCORE = "search.dense-min-score";
+    public static final String NEIGHBOR_RADIUS = "search.neighbor-radius";
+    public static final String NEIGHBOR_MAX = "search.neighbor-max";
 
     public static final String RERANK_PROVIDER = "rerank.provider";
     public static final String RERANK_BASE_URL = "rerank.base-url";
@@ -69,6 +71,8 @@ public final class ConfigSpec {
         b.put(ABSTAIN_THRESHOLD, s.abstainThreshold());
         b.put(INJECTION_BUDGET, s.injectionBudgetChars());
         b.put(DENSE_MIN_SCORE, s.denseMinScore());
+        b.put(NEIGHBOR_RADIUS, s.neighborRadius());
+        b.put(NEIGHBOR_MAX, s.neighborMax());
         b.put(RERANK_PROVIDER, s.rerankProvider());
         b.put(RERANK_BASE_URL, s.rerankBaseUrl());
         b.put(RERANK_API_KEY, s.rerankApiKey());
@@ -110,6 +114,10 @@ public final class ConfigSpec {
                 "注入块字符上限"));
         d.add(new Def(DENSE_MIN_SCORE, ConfigField.Type.DOUBLE, List.of(), -1.0, 1.0,
                 "低于此值的向量不进融合"));
+        d.add(new Def(NEIGHBOR_RADIUS, ConfigField.Type.INT, List.of(), 0.0, 5.0,
+                "命中后把同会话前后各 N 轮一并注入（0 = 关闭）"));
+        d.add(new Def(NEIGHBOR_MAX, ConfigField.Type.INT, List.of(), 0.0, 30.0,
+                "单次最多补几条上下文，防止注入块被邻居撑爆"));
         d.add(new Def(RERANK_PROVIDER, ConfigField.Type.ENUM, List.of("none", "http"),
                 null, null, "http = 调用 {服务地址}/rerank 做精排"));
         d.add(new Def(RERANK_BASE_URL, ConfigField.Type.STRING, List.of(), null, null,
@@ -315,6 +323,12 @@ public final class ConfigSpec {
         out.add(ConfigField.doubleField(DENSE_MIN_SCORE, "search", "向量最低相似度",
                 numOf(effective, DENSE_MIN_SCORE), numOf(baseline, DENSE_MIN_SCORE), -1, 1,
                 help(DENSE_MIN_SCORE)));
+        out.add(ConfigField.intField(NEIGHBOR_RADIUS, "search", "邻域半径 (轮)",
+                intOf(effective, NEIGHBOR_RADIUS), intOf(baseline, NEIGHBOR_RADIUS), 0, 5,
+                help(NEIGHBOR_RADIUS), "1"));
+        out.add(ConfigField.intField(NEIGHBOR_MAX, "search", "最多补几条上下文",
+                intOf(effective, NEIGHBOR_MAX), intOf(baseline, NEIGHBOR_MAX), 0, 30,
+                help(NEIGHBOR_MAX), "6"));
         out.add(ConfigField.enumField(RERANK_PROVIDER, "rerank", "精排来源",
                 List.of("none", "http"), str(effective, RERANK_PROVIDER),
                 str(baseline, RERANK_PROVIDER), help(RERANK_PROVIDER)));

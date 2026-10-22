@@ -137,23 +137,26 @@ def do_ingest(args) -> None:
         sample = conv["sample_id"]
         for num, date, turns in sessions_of(conv["conversation"]):
             if args.granularity == "session":
-                units.append((sample, f"{sample}:s{num}", session_text(num, date, turns)))
+                units.append((sample, f"{sample}:s{num}", session_text(num, date, turns), None))
             else:
                 for turn in turns:
                     dia = turn.get("dia_id") or f"s{num}-{len(units)}"
-                    units.append((sample, f"{sample}:{dia}", turn_text(num, date, turn)))
+                    # turn 是「同会话里的第几轮」，服务端靠它做邻域回填（带上前后各一句）。
+                    # 不给这个字段，检索只能给孤立的一条，模型看不出指代关系。
+                    idx = int(dia.split(":")[1]) if ":" in dia and dia.split(":")[1].isdigit() else None
+                    units.append((sample, f"{sample}:{dia}", turn_text(num, date, turn), idx))
     total = len(units)
     print(f"ingest: {total} 条（粒度 {args.granularity}）", flush=True)
     done = [0]
     lock = threading.Lock()
 
     def one(unit):
-        sample, key, narrative = unit
+        sample, key, narrative, turn_index = unit
         body = {
             "sessionId": key.split(":")[1] if ":" in key else key,
             "projectId": f"locomo-{sample}",
             "items": [{"kind": "episode", "narrative": narrative,
-                       "importance": 0.5, "trustLevel": "high"}],
+                       "importance": 0.5, "trustLevel": "high", "turn": turn_index}],
             "idempotencyKey": f"locomo:{key}",
         }
         try:
@@ -428,7 +431,10 @@ def main() -> None:
     p.add_argument("--table-out", default="")
     p.add_argument("--topk", type=int, default=12)
     p.add_argument("--limit", type=int, default=0)
-    p.add_argument("--concurrency", type=int, default=6)
+    # ★ 默认 2，不是 6。ask 这一步的每一次请求都会打到 embedding + rerank 端点，
+    # 而硅基流动的并发配额很死：并发 6 那轮 78% 的精排被 429 打回，服务端静默退回 RRF，
+    # 分数偏低且看不出来。judge 走的是自建模型端点，可以自己传大一点。
+    p.add_argument("--concurrency", type=int, default=2)
     p.add_argument("--max-context", type=int, default=6000)
     p.add_argument("--granularity", choices=["turn", "session"], default="turn")
     p.add_argument("--llm-base", default=os.environ.get("BENCH_LLM_BASE", ""))

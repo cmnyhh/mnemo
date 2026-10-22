@@ -17,6 +17,7 @@ import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -314,6 +315,11 @@ public class SearchService {
                     degradeReason, rerankState);
         }
 
+        // ---- 邻域回填：命中一条，把它同会话的前后几轮一起给模型 ----
+        // 一条记忆 = 一轮对话，单独给出去常常缺前因后果（「她答应了」离开上一轮不可解）。
+        // LoCoMo 上漏掉的证据约 40% 落在已召回轮次的 ±3 轮以内，补邻居比继续加深检索便宜得多。
+        Map<UUID, List<ItemRow>> neighbours = neighbourRows(tenantId, rows, hits, settings, asOf);
+
         List<Ranking.InjectionEntry> entries = new ArrayList<>();
         List<UUID> touched = new ArrayList<>();
         for (SearchResponse.Hit h : hits) {
@@ -323,6 +329,10 @@ public class SearchService {
                             .map(SearchResponse.AssetRef::caption)
                             .filter(java.util.Objects::nonNull)
                             .toList()));
+            // 邻居紧跟在它所属的命中后面：同一段话连着读，模型才串得起因果。
+            for (ItemRow n : neighbours.getOrDefault(UUID.fromString(h.id()), List.of())) {
+                entries.add(Ranking.InjectionEntry.neighbour(n.tier(), n.narrative(), n.trustLevel()));
+            }
             touched.add(UUID.fromString(h.id()));
         }
         // query 参与裁剪：长记忆留哪一段由它和 query 的词面交集决定，不再从头上硬砍。
@@ -345,6 +355,88 @@ public class SearchService {
      * 一次把上百条送 cross-encoder，对端多半超时，那会整体退回 RRF——比少排几条更糟。
      */
     private static final int MAX_RERANK_WINDOW = 64;
+
+    /**
+     * 最多给几条命中做邻域扩展。
+     *
+     * <p>只取前几条：尾部命中的「上下文价值」递减，而每次回填都是一次额外的库查询 +
+     * 一段注入预算。6 条覆盖了绝大多数「一轮指代上一轮」的情形。
+     */
+    private static final int NEIGHBOR_ANCHORS = 6;
+
+    /**
+     * 取命中条目的同会话邻居。
+     *
+     * <p>约束三条：① 只对前 {@link #NEIGHBOR_ANCHORS} 条命中扩展；② 邻居不能是已命中的条目
+     * （否则注入块里同一条出现两次）；③ 查询失败一律吞掉——回填是锦上添花，不能因为它让检索报错。
+     *
+     * @return 命中 id → 它要带的邻居（按轮次排好）
+     */
+    private Map<UUID, List<ItemRow>> neighbourRows(String tenantId, Map<UUID, ItemRow> rows,
+                                                   List<SearchResponse.Hit> hits,
+                                                   RuntimeConfig.Snapshot settings, OffsetDateTime asOf) {
+        int radius = settings.neighborRadius();
+        int max = settings.neighborMax();
+        if (radius <= 0 || max <= 0 || hits.isEmpty()) {
+            return Map.of();
+        }
+        Set<UUID> exclude = new HashSet<>();
+        List<MemoryRepository.TurnRef> anchors = new ArrayList<>();
+        Map<String, List<UUID>> bySession = new HashMap<>();
+        for (SearchResponse.Hit h : hits) {
+            UUID id = UUID.fromString(h.id());
+            exclude.add(id);
+            if (anchors.size() >= NEIGHBOR_ANCHORS) {
+                continue;
+            }
+            ItemRow row = rows.get(id);
+            if (row == null || !row.hasTurn()) {
+                continue; // 没有会话/轮次的记录（手工写入、跨会话摘要）本来就没有邻居
+            }
+            anchors.add(new MemoryRepository.TurnRef(row.sessionId(), row.turn()));
+            bySession.computeIfAbsent(row.sessionId(), k -> new ArrayList<>()).add(id);
+        }
+        if (anchors.isEmpty()) {
+            return Map.of();
+        }
+        List<ItemRow> found;
+        try {
+            found = repo.neighbors(tenantId, anchors, radius, exclude, asOf, max);
+        } catch (Exception e) {
+            log.warn("邻域回填失败（不影响本轮召回）: {}", e.getMessage());
+            return Map.of();
+        }
+        Map<UUID, List<ItemRow>> out = new HashMap<>();
+        for (ItemRow n : found) {
+            UUID parent = nearestAnchor(n, bySession.get(n.sessionId()), rows);
+            if (parent != null) {
+                out.computeIfAbsent(parent, k -> new ArrayList<>()).add(n);
+            }
+        }
+        return out;
+    }
+
+    /** 一条邻居归给同会话里轮次最近的那条命中：注入块里它要紧跟着最相关的那一句。 */
+    private static UUID nearestAnchor(ItemRow n, List<UUID> candidates, Map<UUID, ItemRow> rows) {
+        if (candidates == null || candidates.isEmpty() || n.turn() == null) {
+            return null;
+        }
+        UUID best = null;
+        int bestGap = Integer.MAX_VALUE;
+        for (UUID c : candidates) {
+            ItemRow p = rows.get(c);
+            if (p == null || !p.hasTurn() || !p.sessionId().equals(n.sessionId())) {
+                continue;
+            }
+            int gap = Math.abs(p.turn() - n.turn());
+            // 同距时按 id 定序，保证同一份数据每次跑出来的注入块完全一样（便于对比实验）。
+            if (gap < bestGap || (gap == bestGap && (best == null || c.toString().compareTo(best.toString()) < 0))) {
+                bestGap = gap;
+                best = c;
+            }
+        }
+        return best;
+    }
 
     /**
      * 无命中时的兜底：最近几条 active 记录，单独标题，明写「未命中直接相关」。

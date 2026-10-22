@@ -66,6 +66,10 @@ memory:
     # 向量路的绝对相似度门槛。RRF 只看名次不看分数，没有这道门槛时
     # 一条毫不相关的向量也会被排成第 1 名（hash 向量尤其明显）。
     dense-min-score: ${MEMORY_DENSE_MIN_SCORE:0.25}
+    # 邻域扩展：一条记忆 = 一轮对话，单独给出去常常缺前因后果（「她答应了」离开上一轮不可解）。
+    # 命中后把同会话前后各 N 轮一并注入，0 = 关闭。上限单次最多补几条，避免把注入块撑爆。
+    neighbor-radius: ${MEMORY_NEIGHBOR_RADIUS:1}
+    neighbor-max: ${MEMORY_NEIGHBOR_MAX:6}
   # 精排（cross-encoder）。none = 不精排，等价于历史行为（按 RRF 名次输出）。
   # 精排是「排序精度」手段，不是召回的必要条件；它在融合之后、截断之前介入。
   rerank:

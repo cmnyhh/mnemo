@@ -6,6 +6,7 @@ import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -33,7 +34,9 @@ public class MemoryRepository {
             rs.getInt("correction_count"),
             toInstant(rs, "valid_from"),
             toInstant(rs, "valid_to"),
-            toInstant(rs, "created_at"));
+            toInstant(rs, "created_at"),
+            rs.getString("session_id"),
+            (Integer) rs.getObject("turn"));
 
     private final JdbcTemplate jdbc;
 
@@ -191,7 +194,8 @@ public class MemoryRepository {
         StringBuilder sql = new StringBuilder("""
                 select id, tenant_id, project_id, scope, kind, tier, trust_level, narrative,
                        importance, confidence, cited_count, correction_count,
-                       lower(valid_range) as valid_from, upper(valid_range) as valid_to, created_at
+                       lower(valid_range) as valid_from, upper(valid_range) as valid_to, created_at,
+                       session_id, turn
                   from memory_item
                  where tenant_id = ? and status = 'active' and id in (
                 """);
@@ -206,6 +210,64 @@ public class MemoryRepository {
             sql.append(" and valid_range @> cast(? as timestamptz)");
             args.add(asOf);
         }
+        return jdbc.query(sql.toString(), ITEM_MAPPER, args.toArray());
+    }
+
+    /** 一条记忆在会话里的坐标，邻域扩展用它去找「前后几句」。 */
+    public record TurnRef(String sessionId, int turn) {
+    }
+
+    /**
+     * 取锚点前后 {@code radius} 轮的同会话记录。
+     *
+     * <p>为什么要这一步：一条记忆等于一轮对话，单独给出去常常缺前因后果——「她答应了」
+     * 离开上一轮就不可解。LoCoMo 上漏掉的证据里约 40% 落在已召回轮次的 ±3 轮以内，
+     * 回填比继续加深检索便宜得多。
+     *
+     * <p>仍然只回 active、且 {@code valid_range} 覆盖 {@code as_of} 的行：邻域不是法外之地，
+     * 被取代或被删的轮次不能借「邻居」身份重新进上下文。
+     */
+    public List<ItemRow> neighbors(String tenantId, List<TurnRef> anchors, int radius,
+                                   Collection<UUID> exclude, OffsetDateTime asOf, int limit) {
+        if (anchors.isEmpty() || radius <= 0 || limit <= 0) {
+            return List.of();
+        }
+        StringBuilder sql = new StringBuilder("""
+                select id, tenant_id, project_id, scope, kind, tier, trust_level, narrative,
+                       importance, confidence, cited_count, correction_count,
+                       lower(valid_range) as valid_from, upper(valid_range) as valid_to, created_at,
+                       session_id, turn
+                  from memory_item
+                 where tenant_id = ? and status = 'active'
+                   and session_id is not null and turn is not null
+                   and (
+                """);
+        List<Object> args = new ArrayList<>();
+        args.add(tenantId);
+        for (int i = 0; i < anchors.size(); i++) {
+            TurnRef a = anchors.get(i);
+            sql.append(i == 0 ? "" : " or ").append("(session_id = ? and turn between ? and ?)");
+            args.add(a.sessionId());
+            args.add(a.turn() - radius);
+            args.add(a.turn() + radius);
+        }
+        sql.append(')');
+        if (exclude != null && !exclude.isEmpty()) {
+            sql.append(" and id not in (");
+            int i = 0;
+            for (UUID id : exclude) {
+                sql.append(i++ == 0 ? "?" : ",?");
+                args.add(id);
+            }
+            sql.append(')');
+        }
+        if (asOf != null) {
+            sql.append(" and valid_range @> cast(? as timestamptz)");
+            args.add(asOf);
+        }
+        // 按会话、轮次排序：同一段话的上下文连着读才像对话，乱序会让模型串不起因果。
+        sql.append(" order by session_id, turn limit ?");
+        args.add(limit);
         return jdbc.query(sql.toString(), ITEM_MAPPER, args.toArray());
     }
 
