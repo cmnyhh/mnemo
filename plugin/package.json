@@ -2,7 +2,7 @@
   "name": "mnemo-memory-core",
   "version": "1.0.0",
   "description": "mnemo 的 dsh 插件：每轮对话自动落库，下一轮按需召回，并暴露 memory_search 工具。",
-  "license": "MIT",
+  "license": "AGPL-3.0-or-later",
   "type": "module",
   "main": "index.js",
   "exports": {

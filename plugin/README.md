@@ -53,4 +53,4 @@ npm run smoke     # mock host: mount, write, next-turn recall, tool call
 
 ## License
 
-MIT
+GNU Affero General Public License v3.0 or later — see [LICENSE](../LICENSE). The plugin is part of mnemo and carries the same terms, including §13 when it talks to a service on someone else's behalf.

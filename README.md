@@ -9,7 +9,7 @@
 <p align="center">
   <a href="https://hub.docker.com/r/yejiu233/mnemo"><img src="https://img.shields.io/docker/pulls/yejiu233/mnemo?label=docker%20pulls" alt="Docker pulls"></a>
   <a href="https://www.npmjs.com/package/@cmnyhh/dsh-mnemo"><img src="https://img.shields.io/npm/v/@cmnyhh/dsh-mnemo?label=npm" alt="npm"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue" alt="License"></a>
 </p>
 
 <p align="center">
@@ -269,4 +269,8 @@ The `docs/` pages are currently written in Chinese.
 
 ## License
 
-MIT
+GNU Affero General Public License v3.0 or later — full text in [LICENSE](LICENSE). Copyright (c) 2026 mnemo contributors.
+
+Commercial use is allowed, on one condition: whoever talks to the service over a network can obtain the source of the version actually running, including your modifications (AGPL §13). Running a modified mnemo as a closed service is not permitted. If that does not fit your case, a separate commercial licence can be discussed.
+
+Releases up to `v1.2.0`, and the npm and image builds published before this change, remain under MIT — that grant cannot be withdrawn from copies already distributed.

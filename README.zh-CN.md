@@ -9,7 +9,7 @@
 <p align="center">
   <a href="https://hub.docker.com/r/yejiu233/mnemo"><img src="https://img.shields.io/docker/pulls/yejiu233/mnemo?label=docker%20pulls" alt="Docker pulls"></a>
   <a href="https://www.npmjs.com/package/@cmnyhh/dsh-mnemo"><img src="https://img.shields.io/npm/v/@cmnyhh/dsh-mnemo?label=npm" alt="npm"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue" alt="License"></a>
 </p>
 
 <p align="center">
@@ -267,4 +267,8 @@ curl -s -X POST https://<你的域名>/v1/memory/search \
 
 ## 许可
 
-MIT
+GNU Affero 通用公共许可证第 3 版（或更新版本），全文见 [LICENSE](LICENSE)。版权所有 (c) 2026 mnemo contributors。
+
+允许商用，但有一个前提：通过网络与这个服务交互的人，能拿到你实际运行的那份源码，包括你的改动（AGPL §13）。把改造过的 mnemo 当闭源服务对外提供，是不允许的。若这套条款不适合你的场景，可以另行商谈商业授权。
+
+`v1.2.0` 及更早的版本，以及本次变更之前发布的 npm 包与镜像，仍按 MIT 授权——已经发出去的副本无法收回。
