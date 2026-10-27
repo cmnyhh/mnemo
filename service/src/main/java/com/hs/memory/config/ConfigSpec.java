@@ -31,11 +31,6 @@ public final class ConfigSpec {
     public static final String DEFAULT_TOP_K = "search.default-top-k";
     public static final String MAX_TOP_K = "search.max-top-k";
     public static final String ABSTAIN_THRESHOLD = "search.abstain-threshold";
-    /** 弃权后换查询重试：off / rules（规则压缩）/ llm（模型改写）/ both / always（规则两路召回）。 */
-    public static final String SQUEEZE_RETRY = "search.squeeze-retry";
-    /** 弃权重试的取值：off 关；rules 规则压缩；llm 模型改写；both 两者依次；always 每轮两路召回。 */
-    public static final List<String> RETRY_MODES =
-            List.of("off", "rules", "llm", "both", "always");
     public static final String INJECTION_BUDGET = "search.injection-budget";
     public static final String DENSE_MIN_SCORE = "search.dense-min-score";
     public static final String NEIGHBOR_RADIUS = "search.neighbor-radius";
@@ -74,7 +69,6 @@ public final class ConfigSpec {
         b.put(DEFAULT_TOP_K, s.defaultTopK());
         b.put(MAX_TOP_K, s.maxTopK());
         b.put(ABSTAIN_THRESHOLD, s.abstainThreshold());
-        b.put(SQUEEZE_RETRY, s.squeezeRetry());
         b.put(INJECTION_BUDGET, s.injectionBudgetChars());
         b.put(DENSE_MIN_SCORE, s.denseMinScore());
         b.put(NEIGHBOR_RADIUS, s.neighborRadius());
@@ -116,10 +110,6 @@ public final class ConfigSpec {
         d.add(new Def(MAX_TOP_K, ConfigField.Type.INT, List.of(), 1.0, 200.0, "调用方最多能要几条"));
         d.add(new Def(ABSTAIN_THRESHOLD, ConfigField.Type.DOUBLE, List.of(), 0.0, 1.0,
                 "第一名低于此分就不注入"));
-        d.add(new Def(SQUEEZE_RETRY, ConfigField.Type.ENUM, RETRY_MODES,
-                null, null,
-                "rules 删疑问套话后重试；llm 让模型看着落选候选改写后重试；both 先规则后模型；"
-                        + "always 每轮都用规则查询两路召回（多一次嵌入）"));
         d.add(new Def(INJECTION_BUDGET, ConfigField.Type.INT, List.of(), 200.0, 8000.0,
                 "注入块字符上限"));
         d.add(new Def(DENSE_MIN_SCORE, ConfigField.Type.DOUBLE, List.of(), -1.0, 1.0,
@@ -268,10 +258,6 @@ public final class ConfigSpec {
         if (abstain < 0 || abstain > 1) {
             throw new IllegalArgumentException("弃权阈值必须在 0..1 之间");
         }
-        String squeeze = str(merged, SQUEEZE_RETRY);
-        if (!RETRY_MODES.contains(squeeze)) {
-            throw new IllegalArgumentException("查询重试只能是 " + String.join(" / ", RETRY_MODES));
-        }
 
         String rerankProvider = str(merged, RERANK_PROVIDER);
         if ("http".equals(rerankProvider)) {
@@ -331,10 +317,6 @@ public final class ConfigSpec {
         out.add(ConfigField.doubleField(ABSTAIN_THRESHOLD, "search", "弃权阈值",
                 numOf(effective, ABSTAIN_THRESHOLD), numOf(baseline, ABSTAIN_THRESHOLD), 0, 1,
                 help(ABSTAIN_THRESHOLD)));
-        out.add(ConfigField.enumField(SQUEEZE_RETRY, "search", "弃权后查询重试",
-                RETRY_MODES,
-                str(effective, SQUEEZE_RETRY), str(baseline, SQUEEZE_RETRY),
-                help(SQUEEZE_RETRY)));
         out.add(ConfigField.intField(INJECTION_BUDGET, "search", "注入预算 (字符)",
                 intOf(effective, INJECTION_BUDGET), intOf(baseline, INJECTION_BUDGET), 200, 8000,
                 help(INJECTION_BUDGET), "1200"));

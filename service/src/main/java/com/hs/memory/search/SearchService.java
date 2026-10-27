@@ -18,8 +18,6 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -63,35 +61,7 @@ public class SearchService {
         long t0 = System.nanoTime();
         String mode = "hybrid";
         try {
-            // 三档策略来自控制台，热生效：off / abstain / always。
-            // always 在 doSearch 内部就做第二路召回（多一次嵌入）；abstain 只在这里兜一层，
-            // 代价只在真正弃权时才付。
-            String strategy = config.snapshot().squeezeRetry();
-            // 落选候选留给重试用：LLM 那条路要看着候选原文挑词，才可能把「备份」对上「pg_dump」。
-            List<String> candidates = new ArrayList<>();
-            SearchResponse response = doSearch(tenantId, req, t0, true, "always".equals(strategy),
-                    candidates);
-            // 弃权之后还有一次机会：换一种问法再检索一遍。
-            //
-            // 而且原结果已经算出来了，重试不成就丢掉，不会让原本能命中的东西变差——
-            // 这正是它与 docs/query-rewrite.md 里被证伪的「替换式扩展」的区别：
-            // 那是替换，这是并集。
-            if (!"off".equals(strategy) && response.abstained()) {
-                for (String retryQuery : retryQueries(strategy, req.query(), candidates)) {
-                    SearchResponse retry = doSearch(tenantId, withQuery(req, retryQuery), t0,
-                            false, false, null);
-                    if (!retry.abstained() && !retry.hits().isEmpty()) {
-                        log.info("弃权重试命中：{} -> {}", abbreviate(req.query()), retryQuery);
-                        metrics.search(retry.route(), "hit", System.nanoTime() - t0);
-                        return new SearchResponse(req.query(), retry.route(), false, retry.count(),
-                                retry.hits(), retry.injection(), retry.elapsedMs(),
-                                append(retry.degradeReason(),
-                                        ("llm".equals(strategy) ? "查询由模型改写：" : "查询已压缩重试：")
-                                                + retryQuery),
-                                retry.rerank());
-                    }
-                }
-            }
+            SearchResponse response = doSearch(tenantId, req, t0);
             mode = response.route();
             metrics.search(mode, outcome(response), System.nanoTime() - t0);
             return response;
@@ -100,60 +70,6 @@ public class SearchService {
             metrics.search(mode, "error", System.nanoTime() - t0);
             throw e;
         }
-    }
-
-    /**
-     * 弃权后依次尝试的替代查询。按策略产出 0~2 条，命中一条就停。
-     *
-     * <p>两条路的取向不同，所以可以叠加：
-     * <ul>
-     *   <li>{@code rules}：删掉确定有害的疑问/套话，便宜、零延迟，但只认枚举过的形状；</li>
-     *   <li>{@code llm}：看着落选候选改写，能跨词汇（「备份」→「pg_dump」），代价一次模型调用。</li>
-     * </ul>
-     * {@code both} 先试规则——它免费，能解决的情况不必付模型的钱。
-     */
-    private List<String> retryQueries(String strategy, String original, List<String> candidates) {
-        List<String> out = new ArrayList<>(2);
-        boolean rules = strategy.startsWith("rules") || "both".equals(strategy)
-                || "abstain".equals(strategy);
-        boolean llm = strategy.startsWith("llm") || "both".equals(strategy);
-        if (rules) {
-            String squeezed = QuerySqueeze.squeeze(original);
-            if (QuerySqueeze.worthRetry(original, squeezed)) {
-                out.add(squeezed);
-            }
-        }
-        if (llm) {
-            LlmQueryDistiller distiller = config.distiller();
-            if (distiller != null) {
-                long t = System.nanoTime();
-                String rewritten = distiller.distill(original, candidates);
-                metrics.searchStage("distill", System.nanoTime() - t);
-                if (rewritten != null && !rewritten.isBlank()
-                        && !rewritten.equals(original) && !out.contains(rewritten)) {
-                    out.add(rewritten);
-                }
-            }
-        }
-        return out;
-    }
-
-    /** 换掉 query，其余检索条件原样保留——重试只该改查询词，不该顺带改过滤条件。 */
-    private static SearchRequest withQuery(SearchRequest req, String query) {
-        return new SearchRequest(query, req.topK(), req.mode(), req.projectId(), req.userId(),
-                req.sessionId(), req.asOf(), req.kinds(), req.scopes(), req.tiers());
-    }
-
-    private static String abbreviate(String q) {
-        if (q == null) {
-            return "";
-        }
-        String t = q.replaceAll("\\s+", " ").trim();
-        return t.length() <= 40 ? t : t.substring(0, 40) + "…";
-    }
-
-    private static String append(String a, String b) {
-        return a == null || a.isBlank() ? b : a + "；" + b;
     }
 
     /**
@@ -170,18 +86,7 @@ public class SearchService {
         return "abstain";
     }
 
-    /**
-     * @param softAbstain 弃权时若还有候选过了最小分，是否给一条「低置信」而不是直接兜底。
-     *                    压缩重试那一趟传 {@code false}：重试本来就只是第二次机会，
-     *                    不该再用灰区内容把一个「仍然没把握」的结果粉饰成命中。
-     * @param multiQuery  是否把压缩查询作为<b>第二路</b>一起召回（always 模式）。
-     *                    与整条链路重跑不同：只多一次嵌入 + 一次查询，精排仍用原 query。
-     * @param candidateOut 非 null 时，把落选候选的原文填进去（供 LLM 改写时参考）。
-     *                     弃权分支会把它们丢掉，所以要在丢弃之前取。
-     */
-    private SearchResponse doSearch(String tenantId, SearchRequest req, long t0,
-                                    boolean softAbstain, boolean multiQuery,
-                                    List<String> candidateOut) {
+    private SearchResponse doSearch(String tenantId, SearchRequest req, long t0) {
         // 每次取一次快照：配置可能刚在控制台改过，本次请求就应按新值走。
         RuntimeConfig.Snapshot settings = config.snapshot();
         String query = req.query() == null ? "" : req.query().trim();
@@ -231,25 +136,10 @@ public class SearchService {
         // 本身就是不可靠的**，不如一次就把全部候选拿出来，让相关性自己排。
         //
         // 隔离并没有变松：租户由令牌决定，跨租户一条都拿不到。
-        // always 模式：把压缩查询作为第二路。只在配置允许时才算——正常回合不该为
-        // 一次可能没用的召回多付 150~560ms 的嵌入。
-        String squeezeText = null;
-        float[] squeezeVector = null;
-        if (multiQuery) {
-            String squeezed = QuerySqueeze.squeeze(query);
-            if (QuerySqueeze.worthRetry(query, squeezed)) {
-                squeezeText = squeezed;
-                try {
-                    squeezeVector = config.embedding().embed(squeezed);
-                } catch (Exception e) {
-                    log.warn("压缩查询嵌入失败（第二路只剩 BM25）: {}", e.getMessage());
-                }
-            }
-        }
         Pass pass = retrieve(tenantId, null, mode, bm25Query, kinds, scopes, tiers,
-                asOf, settings, vector, squeezeText, squeezeVector);
+                asOf, settings, vector);
         return answer(tenantId, req, settings, query, asOf, topK, pass,
-                degrade(embedDegrade, pass), t0, softAbstain, candidateOut);
+                degrade(embedDegrade, pass), t0);
     }
 
     private static String degrade(String embedDegrade, Pass pass) {
@@ -262,8 +152,7 @@ public class SearchService {
     /** 把一次检索尝试变成响应：精排、剪枝、打分、注入块。 */
     private SearchResponse answer(String tenantId, SearchRequest req,
                                   RuntimeConfig.Snapshot settings, String query, OffsetDateTime asOf,
-                                  int topK, Pass pass, String degradeReason, long t0,
-                                  boolean softAbstain, List<String> candidateOut) {
+                                  int topK, Pass pass, String degradeReason, long t0) {
         List<UUID> bm25Ids = pass.bm25Ids();
         List<UUID> denseIds = pass.denseIds();
         // 原始相似度留着：它不随名次归一化改变，是判断「到底有多像」的唯一凭据。
@@ -411,43 +300,13 @@ public class SearchService {
         if (hits.size() > topK) {
             hits = new ArrayList<>(hits.subList(0, topK));
         }
-        if (candidateOut != null) {
-            // 落选候选要在<b>丢弃之前</b>取：弃权分支会把 hits 清空，而模型改写恰恰需要
-            // 看着这些「差一点」的原文挑词，才能把用户的口语对上库里的写法。
-            for (SearchResponse.Hit h : hits) {
-                if (h.narrative() != null && !h.narrative().isBlank()) {
-                    candidateOut.add(h.narrative());
-                    if (candidateOut.size() >= 3) {
-                        break;
-                    }
-                }
-            }
-        }
 
         boolean abstained = Ranking.abstain(bestRerank, bestDense, "applied".equals(rerankState),
-                settings.abstainThreshold());        String route = !bm25Ids.isEmpty() && !denseIds.isEmpty() ? "hybrid"
+                settings.abstainThreshold());
+        String route = !bm25Ids.isEmpty() && !denseIds.isEmpty() ? "hybrid"
                 : (!bm25Ids.isEmpty() ? "bm25" : "dense");
 
         if (abstained) {
-            // 灰区：还有候选过了最小分，只是最佳精排分没够到放弃阈值。
-            // 这一档以前直接并入弃权、退回「最近 3 条」，于是与 query 无关的同一段
-            // 每轮原样出现，看着像检索没生效。但「没够阈值」不等于「无关」——线上实测
-            // 「备份文件放在哪里」这种正常问法只有 0.0x，因为被检索的记录里没有「目录」，
-            // 精排就把分扣穿了。给一条、并明写低置信，比换成无关的最近 3 条更有用。
-            if (softAbstain && !hits.isEmpty()) {
-                SearchResponse.Hit top = hits.get(0);
-                List<Ranking.InjectionEntry> grey = List.of(new Ranking.InjectionEntry(
-                        top.kind(), top.tier(), top.score(), top.narrative(), top.trustLevel(),
-                        top.assets().stream()
-                                .map(SearchResponse.AssetRef::caption)
-                                .filter(java.util.Objects::nonNull)
-                                .toList()));
-                String low = Ranking.renderLowConfidence(grey, settings.injectionBudgetChars(), query);
-                if (!low.isBlank()) {
-                    return new SearchResponse(query, route, true, 0, List.of(), low, elapsed(t0),
-                            degradeReason, rerankState);
-                }
-            }
             // 弃权本身不变（c_wrong >> c_miss），但不再「什么都不给」：0.9.3 起回退到最近
             // 几条，让模型知道记忆里存着什么。不给这一块时，问得泛一点就整块空，模型连
             // 「有记忆系统」都不知道，也就不会去调检索工具。
@@ -619,30 +478,16 @@ public class SearchService {
      * <p>{@code vector} 由调用方算好并复用；为 null 表示向量路不可用（嵌入失败或
      * mode=bm25），此时只走 BM25，不报错。
      */
-    /**
-     * 在一个投影上跑 BM25 + 向量两路。{@code projectId} 为 null 表示不限投影。
-     *
-     * <p>后两个参数是「压缩查询」的第二路：非空时同一对 bm25 / 向量再查一遍，结果按 id
-     * 并集、向量分取较高值。这是 always 模式的实现——它<b>不替换</b>查询，而是多问一次，
-     * 所以原本能命中的东西不会消失（与 {@code docs/query-rewrite.md} 里被证伪的
-     * 「替换式扩展」正相反）。精排仍然只用原 query，否则两路的分数不可比。
-     */
     private Pass retrieve(String tenantId, String projectId, String mode, String bm25Query,
                           List<String> kinds, List<String> scopes, List<String> tiers,
-                          OffsetDateTime asOf, RuntimeConfig.Snapshot settings, float[] vector,
-                          String squeezeText, float[] squeezeVector) {
-        Set<UUID> bm25Seen = new LinkedHashSet<>();
+                          OffsetDateTime asOf, RuntimeConfig.Snapshot settings, float[] vector) {
+        List<UUID> bm25Ids = new ArrayList<>();
         if (!"dense".equals(mode) && !bm25Query.isEmpty()) {
             long stage = System.nanoTime();
             try {
-                collectBm25(tenantId, projectId, bm25Query, kinds, scopes, tiers, asOf,
-                        settings.bm25TopK(), bm25Seen);
-                if (squeezeText != null) {
-                    String second = String.join(" ", Tokenizer.tokenize(squeezeText));
-                    if (!second.isBlank() && !second.equals(bm25Query)) {
-                        collectBm25(tenantId, projectId, second, kinds, scopes, tiers, asOf,
-                                settings.bm25TopK(), bm25Seen);
-                    }
+                for (MemoryRepository.Scored s : repo.bm25(tenantId, projectId, bm25Query,
+                        kinds, scopes, tiers, asOf, settings.bm25TopK())) {
+                    bm25Ids.add(s.id());
                 }
             } catch (Exception e) {
                 // BM25 挂了不该让整次召回失败：继续走向量
@@ -651,19 +496,19 @@ public class SearchService {
                 metrics.searchStage("bm25", System.nanoTime() - stage);
             }
         }
-        List<UUID> bm25Ids = new ArrayList<>(bm25Seen);
 
+        List<UUID> denseIds = new ArrayList<>();
         // 原始相似度留着：它不随名次归一化改变，是判断「到底有多像」的唯一凭据。
-        // 用一个有序 Map 同时保存顺序与分数——两路合并后 id 去重，分数取较高的那次。
-        Map<UUID, Double> denseScores = new LinkedHashMap<>();
+        Map<UUID, Double> denseScores = new HashMap<>();
         String degradeReason = null;
         if (vector != null && !"bm25".equals(mode)) {
             long stage = System.nanoTime();
             try {
                 Map<String, Object> filter = QdrantClient.filter(tenantId, projectId, "active", tiers);
-                collectDense(vector, settings, filter, denseScores);
-                if (squeezeVector != null) {
-                    collectDense(squeezeVector, settings, filter, denseScores);
+                for (QdrantClient.PointHit hit : qdrant.query(vector, settings.denseTopK(),
+                        filter, settings.denseMinScore())) {
+                    denseIds.add(hit.id());
+                    denseScores.put(hit.id(), hit.score());
                 }
             } catch (Exception e) {
                 degradeReason = "向量路降级（只走 BM25）: " + e.getMessage();
@@ -673,26 +518,8 @@ public class SearchService {
                 metrics.searchStage("dense", System.nanoTime() - stage);
             }
         }
-        List<UUID> denseIds = new ArrayList<>(denseScores.keySet());
         return new Pass(bm25Ids, denseIds, denseScores,
                 Ranking.fuse(bm25Ids, denseIds, settings.rrfK()), degradeReason);
-    }
-
-    private void collectBm25(String tenantId, String projectId, String query,
-                             List<String> kinds, List<String> scopes, List<String> tiers,
-                             OffsetDateTime asOf, int limit, Set<UUID> out) {
-        for (MemoryRepository.Scored s : repo.bm25(tenantId, projectId, query,
-                kinds, scopes, tiers, asOf, limit)) {
-            out.add(s.id());
-        }
-    }
-
-    private void collectDense(float[] vector, RuntimeConfig.Snapshot settings,
-                              Map<String, Object> filter, Map<UUID, Double> out) {
-        for (QdrantClient.PointHit hit : qdrant.query(vector, settings.denseTopK(),
-                filter, settings.denseMinScore())) {
-            out.merge(hit.id(), hit.score(), Math::max);
-        }
     }
 
     private static long elapsed(long t0) {
