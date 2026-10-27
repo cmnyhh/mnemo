@@ -209,6 +209,20 @@ public final class Ranking {
         return renderLines(entries, "## 最近的记忆（本轮未命中直接相关，仅供参考）\n", budgetChars, null);
     }
 
+    /**
+     * 灰区块：有候选、也过了最小分，但最佳精排分没够到放弃阈值。
+     *
+     * <p>以前这一档直接并入弃权，退回「最近 3 条」——那几条与 query 无关，于是同一个块
+     * 每轮原样出现，看着像检索没生效。线上实测这种误伤不少：{@code 备份文件放在哪里}
+     * 这种正常问法最佳分只有 0.0x，而被检索的那条记录里根本没有「目录」可答。
+     *
+     * <p>标题单独一种：模型要能看出「这是低置信」，而不是把它当证据用。与
+     * {@link #renderRecent} 的区别是<b>按 query 召回</b>，所以 query 参与长文本裁剪。
+     */
+    public static String renderLowConfidence(List<InjectionEntry> entries, int budgetChars, String query) {
+        return renderLines(entries, "## 可能相关的记忆（未达置信阈值，仅供参考）\n", budgetChars, query);
+    }
+
     private static String renderLines(List<InjectionEntry> entries, String header, int budgetChars,
                                       String query) {
         if (entries.isEmpty()) {

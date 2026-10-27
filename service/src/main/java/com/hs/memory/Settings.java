@@ -26,6 +26,7 @@ public record Settings(
         int defaultTopK,
         int maxTopK,
         double abstainThreshold,
+        String squeezeRetry,
         int injectionBudgetChars,
         double denseMinScore,
         // 邻域扩展：命中一条之后，把它同会话的前后几轮也一起给模型。

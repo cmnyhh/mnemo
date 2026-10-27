@@ -61,6 +61,8 @@ memory:
     max-top-k: ${MEMORY_MAX_TOP_K:50}
     # top1 归一化分低于这个值就弃权（宁可不注入，也不注错）
     abstain-threshold: ${MEMORY_ABSTAIN_THRESHOLD:0.35}
+    # 弃权后换查询重试：off（默认，实测收益不足以默认开启）/ rules / llm / both / always
+    squeeze-retry: ${MEMORY_SQUEEZE_RETRY:off}
     # 注入预算：1200 token ≈ 1200 汉字，按字符数保守控制
     injection-budget-chars: ${MEMORY_INJECTION_BUDGET:1200}
     # 向量路的绝对相似度门槛。RRF 只看名次不看分数，没有这道门槛时

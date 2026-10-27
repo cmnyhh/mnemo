@@ -13,7 +13,7 @@
 
   <groupId>com.hs.memory</groupId>
   <artifactId>memory-service</artifactId>
-  <version>1.4.9</version>
+  <version>1.5.2</version>
   <name>memory-service</name>
   <description>DSH memory service: BM25 + dense hybrid recall over PostgreSQL and Qdrant</description>
 

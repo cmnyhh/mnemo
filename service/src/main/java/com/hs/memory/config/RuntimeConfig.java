@@ -13,6 +13,7 @@ import com.hs.memory.extract.Summarizer;
 import com.hs.memory.rerank.HttpReranker;
 import com.hs.memory.rerank.NoopReranker;
 import com.hs.memory.rerank.Reranker;
+import com.hs.memory.search.LlmQueryDistiller;
 import java.time.Instant;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -57,6 +58,8 @@ public class RuntimeConfig {
     private volatile String extractorKey = "";
     private volatile Summarizer summarizer;
     private volatile String summarizerKey = "";
+    private volatile LlmQueryDistiller distiller;
+    private volatile String distillerKey = "";
 
     public RuntimeConfig(Settings settings, ConfigStore store) {
         this.settings = settings;
@@ -348,6 +351,35 @@ public class RuntimeConfig {
         }
     }
 
+    /**
+     * 弃权后的查询改写器（LLM 版）。与摘要/抽取共用同一份模型配置：
+     * 这里要的是「便宜、快、听话」，不是推理能力，单独开一组字段只会多一个要维护的答案。
+     *
+     * <p>没配模型时返回 null——检索路径据此跳过这条重试，而不是报错。
+     */
+    public LlmQueryDistiller distiller() {
+        Snapshot s = snapshot;
+        if (!s.extractIsHttp() || s.extractBaseUrl() == null || s.extractBaseUrl().isBlank()) {
+            return null;
+        }
+        String key = s.extractBaseUrl() + "|" + s.extractModel() + "|" + s.extractTimeoutMs()
+                + "|" + s.extractApiKey();
+        LlmQueryDistiller local = distiller;
+        if (local != null && key.equals(distillerKey)) {
+            return local;
+        }
+        synchronized (this) {
+            if (distiller != null && key.equals(distillerKey)) {
+                return distiller;
+            }
+            LlmQueryDistiller built = new LlmQueryDistiller(s.extractBaseUrl(), s.extractApiKey(),
+                    s.extractModel(), s.extractTimeoutMs());
+            this.distiller = built;
+            this.distillerKey = key;
+            return built;
+        }
+    }
+
     private Summarizer buildSummarizer(Snapshot s) {
         if (!s.extractIsHttp() || s.extractBaseUrl() == null || s.extractBaseUrl().isBlank()) {
             // 摘要没有「硬切」之外的降级路线，所以这里不打 warn：没配模型是合法状态。
@@ -397,6 +429,7 @@ public class RuntimeConfig {
             int defaultTopK,
             int maxTopK,
             double abstainThreshold,
+            String squeezeRetry,
             int injectionBudgetChars,
             double denseMinScore,
             int neighborRadius,
@@ -431,6 +464,7 @@ public class RuntimeConfig {
                     ConfigSpec.intOf(m, ConfigSpec.DEFAULT_TOP_K),
                     ConfigSpec.intOf(m, ConfigSpec.MAX_TOP_K),
                     ConfigSpec.numOf(m, ConfigSpec.ABSTAIN_THRESHOLD),
+                    ConfigSpec.str(m, ConfigSpec.SQUEEZE_RETRY),
                     ConfigSpec.intOf(m, ConfigSpec.INJECTION_BUDGET),
                     ConfigSpec.numOf(m, ConfigSpec.DENSE_MIN_SCORE),
                     ConfigSpec.intOf(m, ConfigSpec.NEIGHBOR_RADIUS),
