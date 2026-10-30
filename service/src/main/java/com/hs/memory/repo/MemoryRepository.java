@@ -82,29 +82,44 @@ public class MemoryRepository {
         return ids.isEmpty() ? Optional.empty() : Optional.of(ids.get(0));
     }
 
+    /** 同 (tenant, project, subject, predicate) 的 active 事实。 */
+    public record ActiveFact(UUID id, String objectValue) {
+    }
+
     /**
-     * 把同 (tenant, project, subject, predicate) 的 active 事实退休。
-     * 返回被退休的那条 id，用来给新记录写 supersedes_id。
+     * 找同 (tenant, project, subject, predicate) 的 active 事实，排他约束保证最多一条。
      *
-     * <p>为什么先退休再插入：排他约束会拦住两条 active 且区间重叠的记录。
-     * 这个顺序让「覆盖」成为一次原子替换，而不是先删后插的竞态。
+     * <p>{@code for update} 把这一行锁在事务里，让「比较宾语 → 决定退休 → 插入」这三步
+     * 不会和另一个并发写入交错：排他约束会拦住两条 active 且区间重叠的记录，所以调用方
+     * 必须先退休旧的再插入新的，这个顺序把「覆盖」做成一次原子替换，而不是先删后插的竞态。
+     *
+     * <p>之所以把「查」和「退」拆成两步，是因为中间要插一次宾语比较——见
+     * {@code IngestService.persist}：值没变就不该退休。
      */
-    public Optional<UUID> retireActiveFact(String tenantId, String projectId, String subjectKey, String predicate) {
+    public Optional<ActiveFact> findActiveFact(String tenantId, String projectId, String subjectKey,
+            String predicate) {
         if (subjectKey == null || predicate == null) {
             return Optional.empty();
         }
-        List<UUID> ids = jdbc.query("""
-                select id from memory_item
+        List<ActiveFact> rows = jdbc.query("""
+                select id, object_value from memory_item
                  where tenant_id = ? and status = 'active'
                    and subject_key = ? and predicate = ?
                    and coalesce(project_id, '') = coalesce(?, '')
                  for update
                 """,
-                (rs, i) -> rs.getObject("id", UUID.class), tenantId, subjectKey, predicate, projectId);
-        if (ids.isEmpty()) {
-            return Optional.empty();
-        }
-        UUID old = ids.get(0);
+                (rs, i) -> new ActiveFact(rs.getObject("id", UUID.class), rs.getString("object_value")),
+                tenantId, subjectKey, predicate, projectId);
+        return rows.isEmpty() ? Optional.empty() : Optional.of(rows.get(0));
+    }
+
+    /**
+     * 把一条事实退休：状态改 superseded，有效区间在 now() 处闭合。
+     *
+     * <p>闭合而不是删除，是为了留下「这个值在什么时间段成立」。检索侧只取 active，
+     * 所以历史不会混进注入。
+     */
+    public void retireFact(UUID id) {
         jdbc.update("""
                 update memory_item
                    set status = 'superseded',
@@ -113,9 +128,8 @@ public class MemoryRepository {
                          else tstzrange(lower(valid_range), now(), '[)')
                        end,
                        updated_at = now()
-                 where id = ?
-                """, old);
-        return Optional.of(old);
+                 where id = ? and status = 'active'
+                """, id);
     }
 
     /**

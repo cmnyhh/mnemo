@@ -22,6 +22,7 @@ import com.hs.memory.vector.VecHash;
 import com.hs.memory.vector.VectorRegistry;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.text.Normalizer;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
@@ -30,6 +31,7 @@ import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -164,7 +166,7 @@ public class IngestService {
             if (persisted.duplicate()) {
                 duplicates++;
                 results.add(new IngestResponse.Result(persisted.id().toString(),
-                        item.kind(), true, false, join(prepared.note(), "idempotency key 已存在，未重复写入")));
+                        item.kind(), true, false, join(prepared.note(), persisted.note())));
                 continue;
             }
             accepted++;
@@ -181,8 +183,11 @@ public class IngestService {
     private record Prepared(NewItem item, String note) {
     }
 
-    /** {@code superseded} 是被这条顶掉的旧事实，供调用方同步向量 payload。 */
-    private record Persisted(UUID id, boolean duplicate, UUID superseded) {
+    /**
+     * {@code superseded} 是被这条顶掉的旧事实，供调用方同步向量 payload；
+     * {@code note} 是「没写入」的原因，{@code duplicate} 为 true 时一定有值。
+     */
+    private record Persisted(UUID id, boolean duplicate, UUID superseded, String note) {
     }
 
     /**
@@ -417,18 +422,32 @@ public class IngestService {
         return out;
     }
 
-    /** 先查 idem，再退休旧事实，最后插入。顺序错了会把旧事实白白退休掉。 */
+    /** 先查 idem，再比宾语，最后退休旧事实并插入。顺序错了会把旧事实白白退休掉。 */
     private Persisted persist(NewItem item) {
         return tx.execute(status -> {
             Optional<UUID> existing = repo.findIdByKey(item.tenantId(), item.idemKey());
             if (existing.isPresent()) {
-                return new Persisted(existing.get(), true, null);
+                return new Persisted(existing.get(), true, null, "idempotency key 已存在，未重复写入");
             }
             UUID supersedes = null;
-            if ("fact".equals(item.kind()) && item.subjectKey() != null && item.predicate() != null
-                    && !isGenericPredicate(item.predicate())) {
-                supersedes = repo.retireActiveFact(item.tenantId(), item.projectId(),
-                        item.subjectKey(), item.predicate()).orElse(null);
+            if ("fact".equals(item.kind()) && item.subjectKey() != null && item.predicate() != null) {
+                Optional<MemoryRepository.ActiveFact> active = repo.findActiveFact(item.tenantId(),
+                        item.projectId(), item.subjectKey(), item.predicate());
+                if (active.isPresent()) {
+                    MemoryRepository.ActiveFact old = active.get();
+                    // 值没变就不是「新值」，是同一件事换了个说法。退休它等于用一条新描述
+                    // 顶掉旧描述，历史白白闭合，而信息一点没增加。
+                    if (sameValue(old.objectValue(), item.objectValue())) {
+                        return new Persisted(old.id(), true, null, "已有同值事实，未重复写入");
+                    }
+                    // 泛谓词是多值语义（「支持 X」与「支持 Y」并列），退休会把它们互相顶掉；
+                    // 而排他约束又不允许两条 active 并存，所以只能保留先到的那条。
+                    if (isGenericPredicate(item.predicate())) {
+                        return new Persisted(old.id(), true, null, "泛谓词已有一条事实，未重复写入");
+                    }
+                    repo.retireFact(old.id());
+                    supersedes = old.id();
+                }
             }
             // 替换旧事实时 valid_from 传 null，让 SQL 用 now()——retire 用的也是 now()，
             // 同一个事务时间戳，两条区间严丝合缝，不会因为 Java 侧早几毫秒而判定重叠。
@@ -444,10 +463,10 @@ public class IngestService {
             Optional<UUID> inserted = repo.insert(withSupersedes);
             // lambda 里只能引用 effectively final，supersedes 在上面的分支里被赋过值
             final UUID retired = supersedes;
-            return inserted.map(id -> new Persisted(id, false, retired))
+            return inserted.map(id -> new Persisted(id, false, retired, null))
                     .orElseGet(() -> new Persisted(repo.findIdByKey(item.tenantId(), item.idemKey())
                             .orElseThrow(() -> new IllegalStateException("插入后既无新 id 也无既有 id")), true,
-                            retired));
+                            retired, "idempotency key 已存在，未重复写入"));
         });
     }
 
@@ -733,13 +752,48 @@ public class IngestService {
         return Math.max(0, Math.min(1, v));
     }
 
-    /** 单字谓词与泛谓词都不参与冲突消解，只作为普通 fact 存着。 */
+    /**
+     * 单字谓词与泛谓词表达的是多值语义（「支持 X」与「支持 Y」并列），不参与冲突消解。
+     *
+     * <p>但排他约束只允许同 subject + predicate 有一条 active，所以调用方不能「不退休直接插入」
+     * ——那会撞约束报错。正确的处理是保留先到的那条，见 {@code persist}。
+     */
     static boolean isGenericPredicate(String predicate) {
         if (predicate == null || predicate.isBlank()) {
             return true;
         }
-        String p = predicate.trim().toLowerCase();
+        String p = predicate.trim().toLowerCase(Locale.ROOT);
         return p.codePointCount(0, p.length()) <= 1 || GENERIC_PREDICATES.contains(p);
+    }
+
+    /**
+     * 两条事实的宾语是不是同一个值。
+     *
+     * <p>只做形状归一，不做语义判断：让「7800」与「7800（未完成的面板）」判为同一条，
+     * 但不试图让「杭州富阳区」与「杭州市富阳区」相等——那是模型该干的事，规则做不到，
+     * 硬做只会把不同的值误并。任一侧为空时返回 false：比不了的时候宁可走更新，
+     * 也不要静默丢掉新值。
+     */
+    static boolean sameValue(String a, String b) {
+        String x = normalizeValue(a);
+        String y = normalizeValue(b);
+        return x != null && x.equals(y);
+    }
+
+    /**
+     * 归一化一个宾语取值：全半角、大小写、括号注释、标点空白。
+     *
+     * <p>括号里通常是补充说明而不是值本身（「7800（未完成的面板）」→「7800」），所以整块删掉。
+     * 返回 null 表示归一化后没有可比较的内容，调用方据此放弃判定。
+     */
+    static String normalizeValue(String v) {
+        if (v == null) {
+            return null;
+        }
+        String s = Normalizer.normalize(v.trim(), Normalizer.Form.NFKC).toLowerCase(Locale.ROOT);
+        s = s.replaceAll("[（(\\[【][^）)\\]】]*[）)\\]】]", "");
+        s = s.replaceAll("[\\p{IsPunctuation}\\s]+", "");
+        return s.isEmpty() ? null : s;
     }
 
     private String json(Map<String, Object> facts) {
