@@ -63,6 +63,16 @@ class ConversationLogTest {
     }
 
     @Test
+    @DisplayName("短句也算开口：「构建多久」不该因为只有四个字被当成沉默")
+    void countsShortUtterance() {
+        assertEquals(4, ConversationLog.userChars(List.of(msg("user", "构建多久"))));
+        // 单字与空白仍然不算：那不是「说了什么」，只是按到了发送键
+        assertEquals(1, ConversationLog.userChars(List.of(msg("user", "嗯"))));
+        assertTrue(ConversationLog.userChars(List.of(msg("user", "嗯"))) < ConversationLog.MIN_USER_CHARS);
+        assertEquals(0, ConversationLog.userChars(List.of(msg("user", "   "))));
+    }
+
+    @Test
     @DisplayName("人设被塞进 user 消息：只丢这一条，同轮的对话照记")
     void dropsRolePromptButKeepsDialogue() {
         String log = ConversationLog.compose(List.of(

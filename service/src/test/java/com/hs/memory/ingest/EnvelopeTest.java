@@ -146,7 +146,7 @@ class EnvelopeTest {
     }
 
     @Test
-    @DisplayName("用户侧字数按剥完的真实内容算：三千字说明书里有五个字的「fsasf」也只算五个字")
+    @DisplayName("用户侧字数按剥完的真实内容算：三千字说明书里只有五个字的「fsasf」，就算五个字")
     void countsRealUserCharsOnly() {
         String priv = """
                 【当前时间】2026/10/22 15:27:25
@@ -160,7 +160,9 @@ class EnvelopeTest {
 
         // recent 里自己那两句是「助手说的」，不算用户说了话
         assertEquals(5, ConversationLog.userChars(privTurn));
-        assertTrue(ConversationLog.userChars(privTurn) < ConversationLog.MIN_USER_CHARS);
+        // 阈值只回答「有没有人开口」：5 个字算开口。定 8 的时候这句会被当沉默丢掉，
+        // 「构建多久」这类短问句也就一起丢了。
+        assertTrue(ConversationLog.userChars(privTurn) >= ConversationLog.MIN_USER_CHARS);
 
         List<IngestRequest.Message> groupTurn = List.of(
                 new IngestRequest.Message("user", BRIDGE),

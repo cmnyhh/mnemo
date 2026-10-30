@@ -342,9 +342,9 @@ public class IngestService {
             log.info("对话记录被形状过滤拦下 reason={} head={}", reason, head(raw));
             return new Logged(List.of(), "filtered");
         }
-        // 剥完信封只剩几个字，说明这轮没人真正说话（私聊里试键盘的「fsasf」、
-        // 群里被唤醒却没人接话）。不拦的话，桥接的每一条唤醒都会在库里留一条噪声。
-        // 有信号轮不走这条判据：那走的是抽取，短句「端口改成 9090」正是最该留的。
+        // 剥完信封几乎没有字，说明这轮没人开口（群里被唤醒却没人接话）。
+        // 判据只回答「有没有人说话」，不回答「值不值得记」——后者交给抽取模型。
+        // 有信号轮不走这条：那走的是抽取，短句「端口改成 9090」正是最该留的。
         if (!hasSignal(turn)) {
             int userChars = ConversationLog.userChars(turn.messages());
             if (userChars < ConversationLog.MIN_USER_CHARS) {
