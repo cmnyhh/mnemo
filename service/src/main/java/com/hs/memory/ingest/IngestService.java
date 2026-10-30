@@ -113,6 +113,12 @@ public class IngestService {
             extraction = "structured";
         } else if (req.turn() != null && req.turn().messages() != null && !req.turn().messages().isEmpty()) {
             TurnExtraction extracted = extractTurn(req.turn(), explicit);
+            // 排查「这轮为什么没进库」的唯一入口：这条日志同时给出消息构成（谁、多少字）、
+            // 走了哪条路、最终产出几条。没有它只能靠猜，上一轮就猜错过一次。
+            log.info("turn session={} idx={} trigger={} 消息=[{}] 模式={} 产出={} 说明={}",
+                    req.turn().sessionId(), req.turn().index(), req.turn().trigger(),
+                    roleProfile(req.turn()), extracted.mode(), extracted.items().size(),
+                    extracted.note());
             if (!extracted.admitted()) {
                 // 准入被拒是**有效结论**，不是失败：把理由回给写入方，别让它以为写成功了。
                 return new IngestResponse("rejected", 0, 0, List.of(), extracted.note());
@@ -214,7 +220,11 @@ public class IngestService {
      * 于是普通聊天永远查不到。记录和事实的判据本来就不同，不该共用一个开关。
      */
     private TurnExtraction extractTurn(IngestRequest.Turn turn, boolean explicit) {
-        if (!explicit && !hasSignal(turn)) {
+        String joined = joinTurn(turn);
+        // joined 为空 ⇒ 这轮只有宿主塞进来的脚手架（系统提示、人设、工具回显），
+        // 一句「谁说了什么」都没有。这时调模型只会得到「这是提示词模板」的拒收结论，
+        // 白付一次 7~10 秒的调用，所以直接走日志那条路（它同样会判为空并跳过）。
+        if (!explicit && (!hasSignal(turn) || joined.isBlank())) {
             Logged logged = logTurn(turn);
             if (logged.items().isEmpty()) {
                 metrics.admission("rules");
@@ -237,7 +247,7 @@ public class IngestService {
             long stage = System.nanoTime();
             ExtractResult result;
             try {
-                result = extractor.extract(explicit ? explicitPrefix() + joinTurn(turn) : joinTurn(turn));
+                result = extractor.extract(explicit ? explicitPrefix() + joined : joined);
             } finally {
                 metrics.ingestStage("extract", System.nanoTime() - stage);
             }
@@ -392,6 +402,9 @@ public class IngestService {
     private String joinTurn(IngestRequest.Turn turn) {
         StringBuilder sb = new StringBuilder();
         for (IngestRequest.Message m : turn.messages()) {
+            if (isScaffoldingRole(m.role())) {
+                continue;
+            }
             String content = m.content() == null ? "" : m.content().trim();
             if (content.isEmpty()) {
                 continue;
@@ -405,6 +418,44 @@ public class IngestService {
             sb.append(nullSafe(m.role())).append(": ").append(content).append('\n');
         }
         return sb.toString();
+    }
+
+    /** 一条 "role:字数" 的清单，用来在日志里一眼看出这轮到底装了什么。 */
+    private static String roleProfile(IngestRequest.Turn turn) {
+        if (turn.messages() == null) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder();
+        for (IngestRequest.Message m : turn.messages()) {
+            if (m == null) {
+                continue;
+            }
+            if (sb.length() > 0) {
+                sb.append(' ');
+            }
+            String role = m.role() == null || m.role().isBlank() ? "?" : m.role().trim();
+            int len = m.content() == null ? 0 : m.content().length();
+            sb.append(role).append(':').append(len);
+        }
+        return sb.toString();
+    }
+
+    /**
+     * 这些角色的内容是宿主塞给模型的「你现在是什么、你能用什么」，不是谁说的话。
+     *
+     * <p>它们必须挡在抽取之前：一整套人设加插件说明有几千字，模型的结论只会是
+     * 「这是提示词模板，不该进记忆」，于是整轮被拒——而真正的那两句对话反倒从没被看到。
+     * {@link ConversationLog#compose} 早就这么过滤了，抽取这条路漏了同一个判断，
+     * 结果就是「日志那条路正常、抽取那条路天天报系统注入」。
+     */
+    static boolean isScaffoldingRole(String role) {
+        if (role == null) {
+            return false;
+        }
+        return switch (role.trim().toLowerCase(java.util.Locale.ROOT)) {
+            case "system", "developer", "tool", "function" -> true;
+            default -> false;
+        };
     }
 
     private List<IngestRequest.Item> toItems(ExtractResult result) {
