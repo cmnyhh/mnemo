@@ -116,7 +116,8 @@ public class IngestService {
             // 排查「这轮为什么没进库」的唯一入口：这条日志同时给出消息构成（谁、多少字）、
             // 走了哪条路、最终产出几条。没有它只能靠猜，上一轮就猜错过一次。
             log.info("turn session={} idx={} trigger={} 消息=[{}] 模式={} 产出={} 说明={}",
-                    req.turn().sessionId(), req.turn().index(), req.turn().trigger(),
+                    req.sessionId() != null ? req.sessionId() : req.turn().sessionId(),
+                    req.turn().index(), req.turn().trigger(),
                     roleProfile(req.turn()), extracted.mode(), extracted.items().size(),
                     extracted.note());
             if (!extracted.admitted()) {
