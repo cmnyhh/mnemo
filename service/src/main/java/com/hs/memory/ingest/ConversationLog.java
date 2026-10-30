@@ -1,6 +1,7 @@
 package com.hs.memory.ingest;
 
 import com.hs.memory.api.IngestRequest;
+import com.hs.memory.guard.NoiseFilter;
 import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -82,8 +83,10 @@ final class ConversationLog {
             if (m == null) {
                 continue;
             }
-            String role = m.role() == null ? "" : m.role().trim().toLowerCase();
-            if ("tool".equals(role) || "system".equals(role) || "function".equals(role)) {
+            String role = m.role() == null ? "" : m.role().trim();
+            // 与抽取那条路共用同一份角色表（IngestService#isScaffoldingRole）：
+            // 两边各写一份的时候，这份少了 developer，摘要就把开发态指令当成人说的话记了。
+            if (IngestService.isScaffoldingRole(role)) {
                 continue;
             }
             String content = m.content() == null ? "" : m.content().trim();
@@ -96,10 +99,15 @@ final class ConversationLog {
             if (content.isEmpty()) {
                 continue;
             }
+            // role 说「这是用户说的话」，内容却是一整段人设：宿主把系统提示拼进了 user 消息。
+            // 只丢这一条，不丢整轮——别的消息里可能还有真正的对话。
+            if (NoiseFilter.isRolePrompt(content)) {
+                continue;
+            }
             if (content.length() > SUMMARY_MESSAGE_CHARS) {
                 content = clip(content, SUMMARY_MESSAGE_CHARS);
             }
-            sb.append("assistant".equals(role) ? "助手" : "用户").append("：").append(content).append('\n');
+            sb.append("assistant".equalsIgnoreCase(role) ? "助手" : "用户").append("：").append(content).append('\n');
         }
         String narrative = sb.toString().trim();
         if (narrative.length() > SUMMARY_INPUT_CHARS) {
@@ -147,7 +155,13 @@ final class ConversationLog {
             if (content.isEmpty()) {
                 continue;
             }
-            for (String line : Envelope.strip(content).split("\n")) {
+            String stripped = Envelope.strip(content);
+            // 与 compose 同一条判据：人设不算「用户说了话」，否则三千年人设能把
+            // 一个「fsasf」顶过阈值，每轮都在库里留一条噪声。
+            if (NoiseFilter.isRolePrompt(stripped)) {
+                continue;
+            }
+            for (String line : stripped.split("\n")) {
                 if (line.startsWith(Envelope.SELF_SPEAKER + "：")) {
                     continue;
                 }

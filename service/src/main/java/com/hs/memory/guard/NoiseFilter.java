@@ -58,6 +58,29 @@ public final class NoiseFilter {
     /** 孤零零的一行标签（「输出 JSON：」「提取规则：」「对话内容：」）。 */
     private static final Pattern LABEL_LINE =
             Pattern.compile("^\\s*[^\\s:：][^\\n:：]{0,18}[:：]\\s*$");
+    /** 人设的开头形态：{@code 你是…}、{@code You are…}，只在消息**开头**成立。 */
+    private static final Pattern ROLE_OPENING = Pattern.compile(
+            "^[\\s>*#-]*(你|您)(是|作为一名|作为一个)|^[\\s>*#-]*you\\s+are\\b",
+            Pattern.CASE_INSENSITIVE);
+    /**
+     * 人设里几乎必然出现的指令语气。
+     *
+     * <p>用它来把「你是一个审查员，只输出 JSON」和「你是什么意思」「你是哪里人」分开：
+     * 两者都以「你是」开头，差别在于前者在给规矩，后者在提问。只认指令，不认长度。
+     */
+    private static final Pattern DIRECTIVE = Pattern.compile(
+            "请(只|务必|不要|从|将|把)|只输出|不要输出|必须|不得|禁止|禁止输出"
+            + "|你的(职责|任务|角色|身份)|输出格式|提取规则|格式要求|回复要求"
+            + "|\\byou\\s+(must|should|will|are\\s+to)\\b|\\bdo\\s+not\\b|\\bnever\\b",
+            Pattern.CASE_INSENSITIVE);
+    /**
+     * 疑问句的收尾。
+     *
+     * <p>人设在立规矩，提问在要答案，两者都会出现「你是」「必须」这些词。
+     * 「你是说必须重启吗」命中人设的每一个词，但它明明是个问句——这条把它挡回去。
+     */
+    private static final Pattern QUESTION_TAIL =
+            Pattern.compile("[?？]\\s*$|(吗|呢|么)[。.！!~\\s]*$");
     /**
      * 运行态状态播报：**通用状态量 + 数值**，不列任何宿主的专有说法。
      *
@@ -102,6 +125,72 @@ public final class NoiseFilter {
         return check(text, false);
     }
 
+    /**
+     * 一条消息整体是不是「角色设定 / 系统提示」，而不是谁说的话。
+     *
+     * <p>为什么需要它：role 字段是最可靠的结构判据，但前提是宿主老实上报。把整套人设
+     * 拼进 {@code user} 消息里的客户端不少，那时 role 说「这是用户说的」，内容说的相反。
+     * 这一条补的就是这个缝。
+     *
+     * <p>判据是两件事同时成立：**开头**是人设形态（「你是…」「You are…」），**并且**
+     * 通篇在给规矩（「只输出」「必须」「不得」「输出格式」）。只认第一条会误杀
+     * 「你是什么意思」；只认第二条会误杀「这个接口必须传 token 吗」。
+     *
+     * <p>刻意**不**判「像不像模板」：用户贴一段提示词来问「这段有什么问题」，开头是问句，
+     * 这里就不该命中——那段模板是他在讨论的对象，不是宿主注入的背景。
+     *
+     * <p>与 {@link #scaffolding} 的分工：那条判「整条文本是不是噪声」，这条判「这条消息
+     * 是不是宿主替模型装的人设」。前者会整轮丢弃，后者只丢这一条。
+     */
+    public static boolean isRolePrompt(String text) {
+        if (text == null || text.isBlank()) {
+            return false;
+        }
+        String t = text.strip();
+        if (!ROLE_OPENING.matcher(t).find()) {
+            return false;
+        }
+        // 问句不是人设：「你是说必须重启吗」几乎命中了下面每一条。
+        if (QUESTION_TAIL.matcher(t).find()) {
+            return false;
+        }
+        // 开头是人设形态，再看它是不是在立规矩。已有的模板特征（「请只输出」「提取规则：」）
+        // 直接算数，不再要求第二个条件。
+        if (PROMPT_TEMPLATE.matcher(t).find() || PROMPT_TEMPLATE_EN.matcher(t).find()) {
+            return true;
+        }
+        return DIRECTIVE.matcher(t).find();
+    }
+
+    /**
+     * 整轮对话拼好之后的形状检查——比 {@link #scaffolding} 少查一项：提示词模板。
+     *
+     * <p>因为模板是**逐条消息**判的（见 {@link #isRolePrompt}）：命中哪条丢哪条，
+     * 其余照记。若在这里对整轮再判一次「有没有模板特征」，用户在对话里贴一段模板来问
+     * 「这段有什么问题」，整轮（含他真正在问的那句话）会被一起丢掉——模板本来是他
+     * 讨论的对象，不是背景。伪 XML、工具回显、【…】运行态块这些仍然是整轮级的，
+     * 它们的出现意味着整轮都是包装而不是对话。
+     */
+    public static String turnNoise(String text) {
+        if (text == null || text.isBlank()) {
+            return "空内容";
+        }
+        String t = text.strip();
+        if (XML_SCAFFOLD.matcher(t).find() || SOURCE_ID.matcher(t).find()) {
+            return "伪 XML / 消息包装";
+        }
+        if (TOOL_SCAFFOLD.matcher(t).find()) {
+            return "工具调用回显";
+        }
+        if (INJECTED_BLOCK.matcher(t).find()) {
+            return "运行态脚手架块";
+        }
+        if (LABEL_LINE.matcher(t).matches()) {
+            return "孤立标签行";
+        }
+        return null;
+    }
+
     private static String check(String text, boolean includeAmbiguous) {
         if (text == null || text.isBlank()) {
             return "空内容";
@@ -112,6 +201,11 @@ public final class NoiseFilter {
         }
         if (PROMPT_TEMPLATE.matcher(t).find() || PROMPT_TEMPLATE_EN.matcher(t).find()) {
             return "提示词模板";
+        }
+        // 同一条判断的严格形态：「你是…」开头且通篇在立规矩。上面那两条要求出现
+        // 「器 / 助手 / 专家」这类角色词，漏得掉「你是长期记忆的准入审查员」。
+        if (isRolePrompt(t)) {
+            return "角色设定";
         }
         if (TOOL_SCAFFOLD.matcher(t).find()) {
             return "工具调用回显";

@@ -40,6 +40,88 @@ class ConversationLogTest {
     }
 
     @Test
+    @DisplayName("人设与系统提示的各种角色名都跳过：developer / tool_call / observation")
+    void skipsEveryScaffoldingRoleName() {
+        String log = ConversationLog.compose(List.of(
+                msg("developer", "你是一个严格执行输出格式的助手。"),
+                msg("system_message", "环境：macOS 15，可用工具：read/write"),
+                msg("tool_call", "{\"name\":\"read_file\"}"),
+                msg("observation", "file content ..."),
+                msg("function_call", "get_time()"),
+                msg("user", "构建要多久"),
+                msg("assistant", "四十秒左右。")));
+
+        assertEquals("用户：构建要多久\n助手：四十秒左右。", log);
+    }
+
+    @Test
+    @DisplayName("扮演类角色不是脚手架：宁可多记，也别丢掉真正说过的话")
+    void keepsPlayRoles() {
+        String log = ConversationLog.compose(List.of(msg("narrator", "门开了，走廊空无一人。")));
+
+        assertTrue(log.contains("门开了，走廊空无一人。"));
+    }
+
+    @Test
+    @DisplayName("人设被塞进 user 消息：只丢这一条，同轮的对话照记")
+    void dropsRolePromptButKeepsDialogue() {
+        String log = ConversationLog.compose(List.of(
+                msg("user", "你是一个群聊黑话学习器。请从下面的聊天记录中提取可能是黑话的候选项，只输出 JSON。"),
+                msg("user", "今天群里说的「太刀」是什么意思"),
+                msg("assistant", "是太刀鱼的梗。")));
+
+        assertEquals("用户：今天群里说的「太刀」是什么意思\n助手：是太刀鱼的梗。", log);
+    }
+
+    @Test
+    @DisplayName("同一条判据不分语言：英文人设照样丢，且不误伤英文提问")
+    void dropsEnglishRolePrompt() {
+        assertEquals("用户：what port", ConversationLog.compose(List.of(
+                msg("user", "You are a helpful coding assistant. Output only JSON."),
+                msg("user", "what port"))));
+        // 「You are right」不是人设
+        assertEquals("用户：You are right, 8080 then", ConversationLog.compose(List.of(
+                msg("user", "You are right, 8080 then"))));
+    }
+
+    @Test
+    @DisplayName("用户贴提示词来问问题：那段模板是他讨论的对象，整轮都要留")
+    void keepsQuotedPrompt() {
+        String log = ConversationLog.compose(List.of(
+                msg("user", "这段提示词有什么问题：你是一个群聊黑话学习器，请提取黑话。"),
+                msg("assistant", "缺少输出格式约束。")));
+
+        assertTrue(log.startsWith("用户：这段提示词有什么问题"));
+        assertTrue(log.contains("助手：缺少输出格式约束。"));
+    }
+
+    @Test
+    @DisplayName("「你是什么意思」这类日常句不是人设")
+    void keepsOrdinarySecondPerson() {
+        String log = ConversationLog.compose(List.of(
+                msg("user", "你是什么意思，我是说你昨天说的那个端口"),
+                msg("assistant", "8080。")));
+
+        assertTrue(log.contains("你是什么意思"));
+    }
+
+    @Test
+    @DisplayName("问句不是人设：「你是说必须重启吗」命中了人设的每个词，但它在要答案")
+    void keepsQuestionWithDirectiveWords() {
+        assertEquals("用户：你是说必须重启吗", ConversationLog.compose(List.of(
+                msg("user", "你是说必须重启吗"))));
+        assertEquals("用户：这些字段必须都填？", ConversationLog.compose(List.of(
+                msg("user", "这些字段必须都填？"))));
+    }
+
+    @Test
+    @DisplayName("整轮只有人设 ⇒ 一条都不进库")
+    void emptyWhenOnlyRolePrompt() {
+        assertEquals("", ConversationLog.compose(List.of(
+                msg("user", "你是长期记忆的准入审查员，你只输出严格 JSON，不输出任何解释。"))));
+    }
+
+    @Test
     @DisplayName("整轮只有系统消息 ⇒ 空日志，不写")
     void emptyWhenOnlyScaffolding() {
         assertEquals("", ConversationLog.compose(List.of(

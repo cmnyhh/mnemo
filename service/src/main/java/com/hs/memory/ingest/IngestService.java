@@ -225,7 +225,11 @@ public class IngestService {
         // joined 为空 ⇒ 这轮只有宿主塞进来的脚手架（系统提示、人设、工具回显），
         // 一句「谁说了什么」都没有。这时调模型只会得到「这是提示词模板」的拒收结论，
         // 白付一次 7~10 秒的调用，所以直接走日志那条路（它同样会判为空并跳过）。
-        if (!explicit && (!hasSignal(turn) || joined.isBlank())) {
+        //
+        // 显式写入也走这条路：用户说「记住」但这一轮里一句对话都没有，那就没有可记的东西。
+        // 例外它只豁免「准入判断」，不豁免「有没有内容」——放过去只会让模型对着一段
+        // 「用户要求记住下面的内容」的前缀凭空编一条。
+        if (joined.isBlank() || (!explicit && !hasSignal(turn))) {
             Logged logged = logTurn(turn);
             if (logged.items().isEmpty()) {
                 metrics.admission("rules");
@@ -330,8 +334,10 @@ public class IngestService {
             return new Logged(List.of(), "none");
         }
         // 用宽松档：原文里出现代码块、JSON、令牌都是正常的，不该因此丢掉。
-        // 要挡的只有「整轮都是宿主塞进来的脚手架」，那正是 scaffolding 的五条。
-        String reason = NoiseFilter.scaffolding(raw);
+        // 要挡的只有「整轮都是宿主塞进来的脚手架」——伪 XML、工具回显、【…】运行态块。
+        // 提示词模板不在这里查：它已经按单条消息逐条剔过了（见 joinTurn / ConversationLog），
+        // 整轮再判一次会把「用户贴一段提示词问有什么问题」这类正当对话一起丢掉。
+        String reason = NoiseFilter.turnNoise(raw);
         if (reason != null) {
             log.info("对话记录被形状过滤拦下 reason={} head={}", reason, head(raw));
             return new Logged(List.of(), "filtered");
@@ -416,6 +422,10 @@ public class IngestService {
             if (content.isEmpty()) {
                 continue;
             }
+            // 同上：role 说是对话、内容却是人设的，只丢这一条。
+            if (NoiseFilter.isRolePrompt(content)) {
+                continue;
+            }
             sb.append(nullSafe(m.role())).append(": ").append(content).append('\n');
         }
         return sb.toString();
@@ -446,15 +456,27 @@ public class IngestService {
      *
      * <p>它们必须挡在抽取之前：一整套人设加插件说明有几千字，模型的结论只会是
      * 「这是提示词模板，不该进记忆」，于是整轮被拒——而真正的那两句对话反倒从没被看到。
-     * {@link ConversationLog#compose} 早就这么过滤了，抽取这条路漏了同一个判断，
-     * 结果就是「日志那条路正常、抽取那条路天天报系统注入」。
+     *
+     * <p><b>判据只看 role 字段，不看内容</b>。这是整条写入链上唯一一个不需要猜的地方：
+     * 人设和系统提示长什么样没有边界（中文的、英文的、包在标签里的、拼成一行的），
+     * 但「它不是 user 也不是 assistant」是结构化事实。所以宁可在这里把角色名收全一点，
+     * 也不要事后靠正则去认「这段话像不像人设」——那是上一版误杀用户粘贴内容的成因。
+     *
+     * <p>反过来，这里只列**明确不是对话**的角色：{@code user} / {@code assistant} 及其变体
+     * （{@code human} / {@code ai} / {@code model}）不在此列，{@code narrator} 这类
+     * 扮演类角色也不列——宁可多记几句，也别把真正说过的话丢掉。
      */
     static boolean isScaffoldingRole(String role) {
-        if (role == null) {
+        if (role == null || role.isBlank()) {
+            // 老客户端不带 role：按对话处理，不能因为缺字段就把整轮丢掉。
             return false;
         }
         return switch (role.trim().toLowerCase(java.util.Locale.ROOT)) {
-            case "system", "developer", "tool", "function" -> true;
+            // 系统提示 / 人设 / 开发态指令
+            case "system", "system_message", "sys", "developer", "developer_message" -> true;
+            // 工具调用与回显：工具名、参数、结果都不是谁说的话
+            case "tool", "tool_call", "tool_calls", "tool_result", "tool_response",
+                    "function", "function_call", "function_result", "observation" -> true;
             default -> false;
         };
     }
