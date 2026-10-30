@@ -54,7 +54,7 @@ curl -H "Authorization: Bearer $TOKEN" ...
 | --- | --- |
 | `kind` | `fact` / `preference` / `episode` / `note` |
 | `narrative` | 正文。**必须自包含**：带主语、带值、带范围 |
-| `subjectKey` + `predicate` + `objectValue` | 同一条事实的新旧值靠这三个定位；谓词要可区分（「监听端口」而不是「使用」） |
+| `subjectKey` + `predicate` + `objectValue` | 同一条事实的新旧值靠这三个定位：`subject` 与 `predicate` 相同、`objectValue` 归一化后**不同**才取代；相同则视为重复，不写也不退休。谓词要可区分（「监听端口」而不是「使用」） |
 | `recallHints` | 用户将来会怎么问，3～5 条口语短句。进 BM25 与向量 |
 | `tier` | 显式 `T0` 表示钉住。不传按来源推 |
 | `trustLevel` | 只能往下降：`manual`/`tool` 上限 high，`turn` 中，`import` 低 |
