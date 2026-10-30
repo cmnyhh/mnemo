@@ -276,6 +276,9 @@ public class IngestService {
                 // 是「入口只喂了人设」还是「人设后面还跟着真话被一起埋了」，
                 // 这两种的修法完全相反，不能靠猜。
                 log.info("抽取零产出 输入长={} 头={} 尾={}", joined.length(), head(joined), tail(joined));
+                if (DUMP_REJECTED) {
+                    dumpRejected(turn, joined);
+                }
             }
             return new TurnExtraction(withLog(turn, toItems(result), result.summary()).items(),
                     "llm-extract", true, null);
@@ -969,9 +972,32 @@ public class IngestService {
         return "【用户已明确要求记住下面的内容：admit 必须为 true，即使是随机串或编码也要原样记下】\n";
     }
 
+    /**
+     * 把被拒收的一轮原文完整写进日志。默认关闭，只在排查「入口到底喂了什么」时打开。
+     *
+     * <p>头尾各 40 字不够用：真正要回答的是「用户说的话是不是在被我删掉的那一段里」，
+     * 而那一整段既不在头也不在尾。打开方式：环境变量 {@code MNEMO_DUMP_REJECTED=1}。
+     */
+    private static final boolean DUMP_REJECTED = "1".equals(System.getenv("MNEMO_DUMP_REJECTED"));
+
+    private static void dumpRejected(IngestRequest.Turn turn, String joined) {
+        StringBuilder sb = new StringBuilder("被拒收原文 ─────\n");
+        if (turn.messages() != null) {
+            for (IngestRequest.Message m : turn.messages()) {
+                if (m == null) {
+                    continue;
+                }
+                sb.append("[原始 role=").append(m.role()).append(" 长=")
+                        .append(m.content() == null ? 0 : m.content().length()).append("]\n")
+                        .append(m.content()).append("\n─────────\n");
+            }
+        }
+        sb.append("[剥完信封、逐条过滤后的 joined]\n").append(joined).append("\n───── 结束");
+        log.info(sb.toString());
+    }
+
     /** 日志里只露个头：整段提示词打进 journal 会把它淹掉。 */
-    private static String head(String s) {
-        if (s == null) {
+    private static String head(String s) {        if (s == null) {
             return "";
         }
         String t = s.replaceAll("\\s+", " ").trim();
