@@ -132,10 +132,9 @@ public class IngestService {
         int noise = 0;
         for (int i = 0; i < items.size(); i++) {
             IngestRequest.Item current = items.get(i);
-            // ★ 不能用 sourceKind 判「要不要过滤」：items 路径缺省就是 manual，
-            // 工具写入（memory_write）走的正是这条路——白绫把自己的系统提示、
-            // 群消息原文 JSON 当 fact 写进来时，sourceKind 也是 manual。
-            // 唯一该豁免的是 trigger=explicit（用户明确要求记住）。
+            // ★ 不能用 sourceKind 判「要不要过滤」：调用方可以不自报来源，缺省就是
+            // manual，工具写入（memory_write）走的正是这条路。所以这里只按内容形状过滤，
+            // 唯一豁免的是 trigger=explicit（用户明确要求记住）。
             if (!explicit) {
                 // 工具写入允许存 JSON 报文、代码块、令牌这类内容，所以只查脚手架形状；
                 // 抽取出来的条目已经是正常文本，同样走这一套即可。
@@ -505,16 +504,15 @@ public class IngestService {
         if (!SCOPES.contains(scope)) {
             throw new IllegalArgumentException("scope 只能是 user / project / global / agent");
         }
-        String source = lower(item.sourceKind(), req.turn() == null ? "manual" : "turn");
+        String source = resolveSource(item.sourceKind(), req.turn());
         if (!SOURCE.contains(source)) {
             throw new IllegalArgumentException("sourceKind 只能是 turn / tool / manual / import");
         }
-        // 用户说「记住」＝他本人授权，不是模型推断。按手工写入对待，
-        // 否则最该留下的那条记忆反而会被 trust 系数和 low 拦截规则压下去。
+        // 用户说「记住」是一种授权，不是一种来源：它由 confidence 抬高来体现（见下），
+        // 不能改写 sourceKind。之前这里把 explicit 一律写成 manual，代价是工具写入
+        // 在库里和人工写入长得一模一样——事后既数不出「模型写了多少」，也没法按来源回滚。
+        // 信任上限不受影响：TrustPolicy 里 manual 与 tool 同为 high。
         boolean explicit = req.turn() != null && "explicit".equalsIgnoreCase(req.turn().trigger());
-        if (explicit) {
-            source = "manual";
-        }
         String declaredTrust = lower(item.trustLevel(), null);
         if (declaredTrust != null && !TRUST.contains(declaredTrust)) {
             throw new IllegalArgumentException("trustLevel 只能是 high / medium / low");
@@ -827,6 +825,19 @@ public class IngestService {
     private static String lower(String s, String def) {
         String t = blankToNull(s);
         return t == null ? def : t.toLowerCase(java.util.Locale.ROOT);
+    }
+
+    /**
+     * 落库用的来源标签：调用方自报优先，不自报才看请求里有不有 turn。
+     *
+     * <p>为什么不让 explicit 把来源改写成 manual：来源是<b>归因</b>（这条记录是谁写的），
+     * 授权是<b>强度</b>（该不该多信一点）。两者混在一起以后，memory_write 写进来的东西
+     * 和人工录入长得一模一样，事后数不出模型写过什么，也没法按来源回滚。
+     * 授权强度另有出口——{@code trigger=explicit} 会把 confidence 抬到 0.9，
+     * 而 TrustPolicy 给 manual 与 tool 的上限都是 high，所以不改写也不会被压层级。
+     */
+    static String resolveSource(String declared, IngestRequest.Turn turn) {
+        return lower(declared, turn == null ? "manual" : "turn");
     }
 
     private static String upper(String s, String def) {
