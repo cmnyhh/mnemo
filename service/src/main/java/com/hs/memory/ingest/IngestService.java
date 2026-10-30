@@ -222,6 +222,10 @@ public class IngestService {
      */
     private TurnExtraction extractTurn(IngestRequest.Turn turn, boolean explicit) {
         String joined = joinTurn(turn);
+        if (DUMP_REJECTED) {
+            // 排查开关：不管这轮最后成功还是被拒，先把「入口到底喂了什么」原样留下来。
+            dumpTurn(turn, joined);
+        }
         // joined 为空 ⇒ 这轮只有宿主塞进来的脚手架（系统提示、人设、工具回显），
         // 一句「谁说了什么」都没有。这时调模型只会得到「这是提示词模板」的拒收结论，
         // 白付一次 7~10 秒的调用，所以直接走日志那条路（它同样会判为空并跳过）。
@@ -276,9 +280,6 @@ public class IngestService {
                 // 是「入口只喂了人设」还是「人设后面还跟着真话被一起埋了」，
                 // 这两种的修法完全相反，不能靠猜。
                 log.info("抽取零产出 输入长={} 头={} 尾={}", joined.length(), head(joined), tail(joined));
-                if (DUMP_REJECTED) {
-                    dumpRejected(turn, joined);
-                }
             }
             return new TurnExtraction(withLog(turn, toItems(result), result.summary()).items(),
                     "llm-extract", true, null);
@@ -980,8 +981,8 @@ public class IngestService {
      */
     private static final boolean DUMP_REJECTED = "1".equals(System.getenv("MNEMO_DUMP_REJECTED"));
 
-    private static void dumpRejected(IngestRequest.Turn turn, String joined) {
-        StringBuilder sb = new StringBuilder("被拒收原文 ─────\n");
+    private static void dumpTurn(IngestRequest.Turn turn, String joined) {
+        StringBuilder sb = new StringBuilder("入口原文 ─────\n");
         if (turn.messages() != null) {
             for (IngestRequest.Message m : turn.messages()) {
                 if (m == null) {
@@ -992,7 +993,8 @@ public class IngestService {
                         .append(m.content()).append("\n─────────\n");
             }
         }
-        sb.append("[剥完信封、逐条过滤后的 joined]\n").append(joined).append("\n───── 结束");
+        sb.append("[剥完信封、逐条过滤后的 joined 长=").append(joined.length()).append("]\n")
+                .append(joined).append("\n───── 结束");
         log.info(sb.toString());
     }
 
