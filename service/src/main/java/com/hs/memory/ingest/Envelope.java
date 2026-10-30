@@ -152,6 +152,9 @@ final class Envelope {
             + "(?:\\d{1,2}:\\d{2}\\s+)?"
             + "[^\\s\\-*#>：:][^：:\\n]{0,29}?\\s*(?:：|:\\s)\\s*\\S");
 
+    /** 行首的消息编号 {@code [#838300464]}，剥完对话记录后要去掉。 */
+    private static final Pattern MESSAGE_ID = Pattern.compile("^\\s*\\[#\\d+\\]\\s*");
+
     /** 载荷里用来表示「谁说的」的字段名。 */
     private static final List<String> SENDER_KEYS =
             List.of("sender", "userName", "nickname", "name", "user", "author");
@@ -408,7 +411,12 @@ final class Envelope {
         for (int i = 0; i < lines.length; i++) {
             String line = lines[i].trim();
             if (line.length() >= 4 && TURN_LINE.matcher(line).find()) {
-                return String.join("\n", java.util.Arrays.copyOfRange(lines, i, lines.length)).trim();
+                String[] kept = java.util.Arrays.copyOfRange(lines, i, lines.length);
+                for (int j = 0; j < kept.length; j++) {
+                    // 消息 ID 对这层没用（摘要只关心谁说了什么），留着还会被模型当成群号。
+                    kept[j] = MESSAGE_ID.matcher(kept[j]).replaceFirst("");
+                }
+                return String.join("\n", kept).trim();
             }
         }
         return section.trim();
