@@ -263,7 +263,76 @@ class EnvelopeTest {
         assertTrue(log.length() < ConversationLog.SUMMARY_MESSAGE_CHARS + 40, log);
     }
 
-    private static int count(String text, String needle) {        int n = 0;
+    @Test
+    @DisplayName("用户贴代码问问题：<file> 里的内容必须留下，不能连代码一起吞掉")
+    void keepsUserPastedFile() {
+        String ask = """
+                帮我看看这个文件有什么问题
+                <file path="a.py">
+                def f():
+                    return 1/0
+                </file>
+                怎么改
+                """;
+        String out = Envelope.strip(ask);
+
+        assertTrue(out.contains("return 1/0"), out);
+        assertTrue(out.contains("帮我看看这个文件有什么问题"), out);
+        assertTrue(out.contains("怎么改"), out);
+        assertFalse(out.contains("<file"), out);
+    }
+
+    @Test
+    @DisplayName("只贴文件不说话：也要留下内容，不许剥成空串让整轮消失")
+    void keepsSolePastedFile() {
+        String only = """
+                <file path="a.py">
+                def f():
+                    return 1/0
+                </file>
+                """;
+        String out = Envelope.strip(only);
+
+        assertTrue(out.contains("return 1/0"), out);
+        assertFalse(out.contains("<file"), out);
+    }
+
+    @Test
+    @DisplayName("用户贴报错：<system> 里的信息不能被当成宿主人设整块删")
+    void keepsUserPastedSystemError() {
+        String out = Envelope.strip("报错了\n<system>out of memory</system>");
+
+        assertTrue(out.contains("out of memory"), out);
+        assertTrue(out.contains("报错了"), out);
+    }
+
+    @Test
+    @DisplayName("真信封才整块删文件：有 system-reminder 时 <file> 是宿主喂的背景")
+    void dropsFileInsideRealEnvelope() {
+        String envelope = """
+                <system-reminder>Today is 2026-10-22.</system-reminder>
+                <file path="Pool.java">class Pool { }</file>
+                <user_query>连接池怎么写</user_query>
+                """;
+        String out = Envelope.strip(envelope);
+
+        assertTrue(out.contains("连接池怎么写"), out);
+        assertFalse(out.contains("class Pool"), out);
+        assertFalse(out.contains("Today is"), out);
+    }
+
+    @Test
+    @DisplayName("嵌套同名标签不留碎片：脱壳后不能剩下半个闭合标签")
+    void leavesNoTagRemnantWhenNested() {
+        String out = Envelope.strip("<context>外层<context>内层</context>还活着吗</context>");
+
+        assertTrue(out.contains("还活着吗"), out);
+        assertFalse(out.contains("</context>"), out);
+        assertFalse(out.contains("<context>"), out);
+    }
+
+    private static int count(String text, String needle) {
+        int n = 0;
         int from = 0;
         while (true) {
             int at = text.indexOf(needle, from);

@@ -50,26 +50,36 @@ final class Envelope {
     private static final Pattern SECTION = Pattern.compile("【[^】\\n]{1,20}】");
 
     /**
-     * 「上下文类」标签：里面装的是宿主喂给模型的背景，不是对话本身，整块删掉。
+     * 「强信号」上下文标签：宿主专用，任何 agent 宿主都用它装背景，用户自己不会手写。
      *
-     * <p>这张表只收**语义角色**，不收产品名。判据是「这个标签在任何一个 agent 宿主里
-     * 都会用来装背景」——系统提醒、指令、上下文、工具清单、文件内容、检索结果、仓库状态。
-     * 用户自己写的配置根标签（{@code <configuration>}、{@code <project>}、{@code <bean>}）
-     * 一个都不在里面，所以粘配置不会被吃掉。
+     * <p>这批**无条件整块删**：整段只剩它们时说明本轮确实只有脚手架。
      */
-    private static final List<String> CONTEXT_TAGS = List.of(
-            "system-reminder", "system", "system_prompt", "system_message", "sys_prompt",
-            "instructions", "instruction", "context", "additional_context", "extra_context",
-            "rules", "guidelines", "environment", "env", "env_info", "runtime",
-            "available_tools", "tools", "tool", "tool_definitions", "tool_result",
-            "functions", "function", "function_results", "examples", "prompt",
-            "developer", "developer_message", "result", "results",
-            "files", "file", "open_files", "active_file", "context_files",
+    private static final List<String> STRONG_TAGS = List.of(
+            "system-reminder", "system_prompt", "system_message", "sys_prompt",
+            "instructions", "instruction", "rules", "guidelines",
+            "environment", "env", "env_info", "runtime",
+            "available_tools", "tool_definitions", "tool_result", "function_results",
+            "developer", "developer_message", "additional_context", "extra_context",
+            "retrieved_documents", "repo_structure", "directory_structure", "repository",
+            "codebase", "git_status", "project_context", "workspace",
+            "ide_state", "editor_state", "cursor_rules");
+
+    /**
+     * 「弱信号」上下文标签：宿主拿它装背景，但**用户也会自己写**——贴一段文件问哪里有 bug、
+     * 贴查询结果问为什么少了三条、贴自己的 memory 配置问写法对不对。
+     *
+     * <p>所以这批不能无条件删。只有整段已经确认是信封（见 {@link #looksLikeEnvelope}）时
+     * 才整块删；否则**只脱壳、留内容**——内容进了抽取视野，标签也不会再触发伪 XML 判据。
+     *
+     * <p>这一档是实测踩出来的：早先把 {@code <file>} 当强信号，用户「帮我看看这个文件」贴进来的
+     * 代码整块消失，只剩那句问话；只贴文件不说话时更是剥成空串，整轮一条都不进库。
+     */
+    private static final List<String> WEAK_TAGS = List.of(
+            "context", "system", "file", "files", "open_files", "active_file", "context_files",
             "documents", "document", "attachments", "attachment",
-            "retrieved_documents", "knowledge", "memory", "memories",
-            "repo_structure", "directory_structure", "repository", "codebase",
-            "snippets", "git_status", "project_context", "workspace",
-            "ide_state", "editor_state", "cursor_rules", "metadata");
+            "result", "results", "memory", "memories", "knowledge",
+            "tools", "tool", "functions", "function", "examples", "prompt",
+            "snippets", "metadata");
 
     /**
      * 「对话类」标签：里面装的是人说的话，只去掉标签、留下文本。
@@ -82,14 +92,32 @@ final class Envelope {
             "request", "query", "message", "chat");
 
     /** 一次删掉一个上下文块；{@code \1} 保证开闭标签同名。 */
-    private static final Pattern CONTEXT_BLOCK = Pattern.compile(
-            "<(" + String.join("|", CONTEXT_TAGS) + ")(\\s[^>]*)?>[\\s\\S]*?</\\1\\s*>",
-            Pattern.CASE_INSENSITIVE);
+    private static final Pattern STRONG_BLOCK = block(STRONG_TAGS);
+    /** 同上，但只在整段确认是信封时才用。 */
+    private static final Pattern WEAK_BLOCK = block(WEAK_TAGS);
+    /** 已知标签的开/闭形式，用来清掉嵌套同名标签留下的碎片。 */
+    private static final Pattern KNOWN_TAG = tag(concat(STRONG_TAGS, WEAK_TAGS));
 
     /** 对话类标签只去壳。 */
-    private static final Pattern DIALOGUE_TAG = Pattern.compile(
-            "</?(?:" + String.join("|", DIALOGUE_TAGS) + ")(?:\\s[^>]*)?>",
-            Pattern.CASE_INSENSITIVE);
+    private static final Pattern DIALOGUE_TAG = tag(DIALOGUE_TAGS);
+
+    private static Pattern block(List<String> tags) {
+        return Pattern.compile(
+                "<(" + String.join("|", tags) + ")(\\s[^>]*)?>[\\s\\S]*?</\\1\\s*>",
+                Pattern.CASE_INSENSITIVE);
+    }
+
+    private static Pattern tag(List<String> tags) {
+        return Pattern.compile("</?(?:" + String.join("|", tags) + ")(?:\\s[^>]*)?>",
+                Pattern.CASE_INSENSITIVE);
+    }
+
+    private static List<String> concat(List<String> a, List<String> b) {
+        List<String> out = new ArrayList<>(a.size() + b.size());
+        out.addAll(a);
+        out.addAll(b);
+        return out;
+    }
 
     /** 只看末尾这么长的范围找载荷：载荷总在信的最后一节。 */
     private static final int TAIL_SCAN_CHARS = 60_000;
@@ -233,19 +261,21 @@ final class Envelope {
     /**
      * 删掉上下文类块、脱掉对话类标签。
      *
+     * <p>强信号（宿主专用）无条件整块删；弱信号（用户也会自己写的 {@code <file>}、
+     * {@code <result>}、{@code <memory>}）只在整段确认是信封时才整块删，否则只脱壳留内容。
+     *
      * <p>什么都不命中就原样返回；命中且删空返回空串。
      */
     private static String stripContextBlocks(String body) {
-        Matcher blocks = CONTEXT_BLOCK.matcher(body);
-        String out = body;
-        if (blocks.find()) {
-            // 逐块删除：replaceAll 会重建字符串，这里只需要一次，且要保留未命中的部分。
-            out = blocks.replaceAll("");
+        boolean envelope = looksLikeEnvelope(body);
+        String out = STRONG_BLOCK.matcher(body).replaceAll("");
+        if (envelope) {
+            out = WEAK_BLOCK.matcher(out).replaceAll("");
         }
-        String bare = DIALOGUE_TAG.matcher(out).replaceAll("");
-        if (!bare.equals(out)) {
-            out = bare;
-        }
+        // 嵌套同名标签会让非贪婪匹配留下碎片（「…还活着吗</context>」），统一清掉。
+        // 弱信号脱壳也走这里：内容留下，标签不留给形状过滤当伪 XML 的证据。
+        out = KNOWN_TAG.matcher(out).replaceAll("");
+        out = DIALOGUE_TAG.matcher(out).replaceAll("");
         if (!out.equals(body) && out.isBlank()) {
             // 整段都是宿主喂的背景，没有人说话。
             return "";
@@ -253,17 +283,36 @@ final class Envelope {
         return out;
     }
 
-    // ---------------------------------------------------------------- 形状三：【小节】说明书
+    /**
+     * 整段是否已经确认是「宿主拼出来的信封」。
+     *
+     * <p>判据只有两条：出现宿主专用的强信号标签，或者【小节】标题多到不像人写的。
+     * 单看一个 {@code <file>} 不够——那可能只是用户在贴代码。
+     */
+    private static boolean looksLikeEnvelope(String body) {
+        if (STRONG_BLOCK.matcher(body).find()) {
+            return true;
+        }
+        return sectionCount(body) >= 3;
+    }
 
-    private static String stripSections(String body) {
+    /** 数到三条就够判断了，不必数完。 */
+    private static int sectionCount(String body) {
         Matcher section = SECTION.matcher(body);
-        int sections = 0;
+        int n = 0;
         while (section.find()) {
-            sections += 1;
-            if (sections > 2) {
+            n += 1;
+            if (n >= 3) {
                 break;
             }
         }
+        return n;
+    }
+
+    // ---------------------------------------------------------------- 形状三：【小节】说明书
+
+    private static String stripSections(String body) {
+        int sections = sectionCount(body);
         if (sections == 0) {
             return body;
         }
