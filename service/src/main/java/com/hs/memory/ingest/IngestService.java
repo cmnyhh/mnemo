@@ -454,6 +454,10 @@ public class IngestService {
         if (NoiseFilter.isRolePrompt(content)) {
             return new Review(role, "", "人设");
         }
+        // 控制哨兵（[[END]]、[[SLEEP:180]]…）是协议不是话，assistant 位置上出现得尤其多。
+        if (NoiseFilter.isControlToken(content)) {
+            return new Review(role, "", "哨兵");
+        }
         return new Review(role, content, null);
     }
 

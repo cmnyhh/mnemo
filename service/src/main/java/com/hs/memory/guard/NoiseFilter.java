@@ -125,6 +125,10 @@ public final class NoiseFilter {
         return check(text, false);
     }
 
+    /** 控制哨兵：整条只有 {@code [[…]]}，没有别的话。 */
+    private static final Pattern CONTROL_ONLY =
+            Pattern.compile("^(?:\\[\\[[^\\]\\n]{1,60}\\]\\]\\s*)+$");
+
     /**
      * 一条消息整体是不是「角色设定 / 系统提示」，而不是谁说的话。
      *
@@ -160,6 +164,20 @@ public final class NoiseFilter {
             return true;
         }
         return DIRECTIVE.matcher(t).find();
+    }
+
+    /**
+     * 整条是不是宿主/客户端的**控制哨兵**，一个字的人话都没有。
+     *
+     * <p>{@code [[END]]}、{@code [[SLEEP:180]]}、{@code [[LATER:30|提醒一句]]} 这类标记用来
+     * 告诉宿主「说完了」「先睡一会」，是协议的一部分，不是谁说的话。它们在 assistant 位置上
+     * 出现得很频繁，当成对话记下来就等于每轮都往库里塞一句「[[SLEEP:180]]」。
+     *
+     * <p>判据只认形状：整条（可含多条并排）都是 {@code [[…]]}，中间没有任何别的文字。
+     * 用户说「用 [[双括号]] 标注重点」这类话里有别的字，不会命中。
+     */
+    public static boolean isControlToken(String text) {
+        return text != null && CONTROL_ONLY.matcher(text.strip()).matches();
     }
 
     /**

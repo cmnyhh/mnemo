@@ -108,6 +108,10 @@ final class ConversationLog {
             if (NoiseFilter.isRolePrompt(content)) {
                 continue;
             }
+            // 控制哨兵不是话（[[END]]、[[SLEEP:180]]…），两条路同一个判据。
+            if (NoiseFilter.isControlToken(content)) {
+                continue;
+            }
             if (content.length() > SUMMARY_MESSAGE_CHARS) {
                 content = clip(content, SUMMARY_MESSAGE_CHARS);
             }

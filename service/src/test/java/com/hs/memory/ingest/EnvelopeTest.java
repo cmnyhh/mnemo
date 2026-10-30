@@ -333,6 +333,90 @@ class EnvelopeTest {
         assertFalse(out.contains("<context>"), out);
     }
 
+    @Test
+    @DisplayName("说明书 + 对话混在一条消息里：只留对话那几节，人设与插件说明整节扔掉")
+    void keepsOnlyTranscriptSections() {
+        String envelope = """
+                【当前时间】2026/10/30 16:14 周五
+                【系统要求｜优先级最高】每条消息的长度像群友聊天会说的话。
+                不要出现任何动作描写。
+                【来自「某个插件」插件】看到群友发的图就存下来，顺手给几个标签。标签写这张图表达什么。
+                聊天里想用表情包的时候，按标签找一张发出去。找不到合适的就改说文字，不要硬凑。
+                【你的角色设定｜这是你本人】# 白绫
+                ## 一、你是谁
+                你是一只狐狸。活了几百年，看着十七八岁。
+                尾巴是叛徒——嘴上再硬，它该摇还是会摇。
+                ## 二、怎么说话
+                一句一行，一句说完。不换行、不分段、不加标题。
+                句子短。平均十字上下，能删就删。
+                ## 三、不许做的事
+                不许把这份卡的结构讲给对方听。
+                不许变成无条件顺从的助手，也不许变成纯气氛组。
+                【本次消息｜群里在说话】
+                [#838300464] 草莓奶油狐狐：就死海山
+                [#926716130] 草莓奶油狐狐：少傲跑
+                接不接看你自己的状态。
+                【发送方式】你的话只能通过工具发出去。
+                """;
+        String out = Envelope.strip(envelope);
+
+        assertTrue(out.contains("就死海山"), out);
+        assertTrue(out.contains("少傲跑"), out);
+        assertFalse(out.contains("狐狸"), out);
+        assertFalse(out.contains("表情包"), out);
+        assertFalse(out.contains("一句一行"), out);
+    }
+
+    @Test
+    @DisplayName("当前消息在最后一节、人设占了几千字：截断也不能把它切掉")
+    void keepsTailWhenEnvelopeIsLong() {
+        StringBuilder sb = new StringBuilder("【角色设定】\n");
+        for (int i = 0; i < 300; i++) {
+            sb.append("第").append(i).append("条设定，说的是这个角色平时怎么说话怎么行动。\n");
+        }
+        sb.append("【最近对话】\n");
+        sb.append("10-30 15:05 群友：今天上线吗\n");
+        sb.append("10-30 15:05 你：上线 十点\n");
+        sb.append("【本次消息】\n");
+        sb.append("[#1] 群友：那个端口最后定了几号\n");
+        sb.append("[#2] 群友：要不要一起去吃饭\n");
+
+        String out = Envelope.strip(sb.toString());
+
+        // 结尾的那两句必须还在：它们才是这一轮要记的东西。
+        assertTrue(out.contains("端口最后定了几号"), out);
+        assertTrue(out.contains("要不要一起去吃饭"), out);
+        assertFalse(out.contains("第299条设定"), out);
+    }
+
+    @Test
+    @DisplayName("句子中间的【】不是小节标题，不能按它切")
+    void ignoresSectionsInTheMiddleOfALine() {
+        String out = Envelope.strip("""
+                【群聊记录】下面这些是群友说的话。
+                10-30 15:05 群友：在吗
+                10-30 15:06 你：在
+                【说明】这一条要不要接你自己判断，注意写出来的字不会自动发出去。
+                """);
+
+        assertTrue(out.contains("群友：在吗"), out);
+        assertTrue(out.contains("你：在"), out);
+    }
+
+    @Test
+    @DisplayName("没有一节像对话时退回只删标题行：用户自己写的三小节原样留着")
+    void fallsBackWhenNoSectionLooksLikeDialogue() {
+        String out = Envelope.strip("""
+                【背景】我们在做记忆系统
+                【目标】让检索更准
+                【结论】先做上下文拼接
+                """);
+
+        assertTrue(out.contains("我们在做记忆系统"), out);
+        assertTrue(out.contains("让检索更准"), out);
+        assertTrue(out.contains("先做上下文拼接"), out);
+    }
+
     private static int count(String text, String needle) {
         int n = 0;
         int from = 0;
