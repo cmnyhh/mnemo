@@ -271,6 +271,12 @@ public class IngestService {
             metrics.admission("keep");
             log.info("抽取完成 model={} items={} latency={}ms reason={}",
                     result.model(), result.count(), result.latencyMs(), result.reason());
+            if (result.count() == 0) {
+                // 零产出时把喂进去的头尾打出来：光有「reason=整段是提示词」无法判断
+                // 是「入口只喂了人设」还是「人设后面还跟着真话被一起埋了」，
+                // 这两种的修法完全相反，不能靠猜。
+                log.info("抽取零产出 输入长={} 头={} 尾={}", joined.length(), head(joined), tail(joined));
+            }
             return new TurnExtraction(withLog(turn, toItems(result), result.summary()).items(),
                     "llm-extract", true, null);
         } catch (ExtractException e) {
@@ -409,29 +415,55 @@ public class IngestService {
     private String joinTurn(IngestRequest.Turn turn) {
         StringBuilder sb = new StringBuilder();
         for (IngestRequest.Message m : turn.messages()) {
-            if (isScaffoldingRole(m.role())) {
+            Review review = review(m);
+            if (review.content().isEmpty()) {
                 continue;
             }
-            String content = m.content() == null ? "" : m.content().trim();
-            if (content.isEmpty()) {
-                continue;
-            }
-            // 抽取也要先剥信封：把三千字的角色设定与表情包策略喂给模型，
-            // 它只会判「这是提示词模板」然后整轮拒收，真正群聊的那两句反倒看不到。
-            content = Envelope.strip(content);
-            if (content.isEmpty()) {
-                continue;
-            }
-            // 同上：role 说是对话、内容却是人设的，只丢这一条。
-            if (NoiseFilter.isRolePrompt(content)) {
-                continue;
-            }
-            sb.append(nullSafe(m.role())).append(": ").append(content).append('\n');
+            sb.append(review.role()).append(": ").append(review.content()).append('\n');
         }
         return sb.toString();
     }
 
+    /**
+     * 一条消息能不能进抽取/记录：留下则给出剥完信封的内容，丢弃则给出理由。
+     *
+     * <p>三道判断顺序是「不用猜的先上」：role 字段 → 剥信封后是否为空 → 内容像不像人设。
+     * {@link #joinTurn} 与 {@link #roleProfile} 共用这一份，两处各写一份必然走偏——
+     * developer 角色被漏、日志里说「留着」实际却被丢，都是这么来的。
+     */
+    private static Review review(IngestRequest.Message m) {
+        String role = m.role() == null || m.role().isBlank() ? "?" : m.role().trim();
+        if (isScaffoldingRole(m.role())) {
+            return new Review(role, "", "脚手架");
+        }
+        String content = m.content() == null ? "" : m.content().trim();
+        if (content.isEmpty()) {
+            return new Review(role, "", "空");
+        }
+        // 抽取也要先剥信封：把三千字的角色设定与表情包策略喂给模型，
+        // 它只会判「这是提示词模板」然后整轮拒收，真正群聊的那两句反倒看不到。
+        content = Envelope.strip(content);
+        if (content.isEmpty()) {
+            return new Review(role, "", "剥空");
+        }
+        // 同上：role 说是对话、内容却是人设的，只丢这一条。
+        if (NoiseFilter.isRolePrompt(content)) {
+            return new Review(role, "", "人设");
+        }
+        return new Review(role, content, null);
+    }
+
+    /** 单条消息的过滤结论：{@code content} 为空表示丢弃，{@code dropped} 记原因。 */
+    private record Review(String role, String content, String dropped) {
+    }
+
     /** 一条 "role:字数" 的清单，用来在日志里一眼看出这轮到底装了什么。 */
+    /**
+     * 一条 "role:字数" 的清单，用来在日志里一眼看出这轮到底装了什么。
+     *
+     * <p>丢弃的条目带上原因（{@code user:9019(人设)}），因为「没进库」的三种成因——
+     * 入口喂了人设、内容被剥空、用户侧本来就短——光看字数分不开。
+     */
     private static String roleProfile(IngestRequest.Turn turn) {
         if (turn.messages() == null) {
             return "";
@@ -444,9 +476,12 @@ public class IngestService {
             if (sb.length() > 0) {
                 sb.append(' ');
             }
-            String role = m.role() == null || m.role().isBlank() ? "?" : m.role().trim();
+            Review review = review(m);
             int len = m.content() == null ? 0 : m.content().length();
-            sb.append(role).append(':').append(len);
+            sb.append(review.role()).append(':').append(len);
+            if (review.dropped() != null) {
+                sb.append('(').append(review.dropped()).append(')');
+            }
         }
         return sb.toString();
     }
@@ -499,24 +534,34 @@ public class IngestService {
     /** 先查 idem，再比宾语，最后退休旧事实并插入。顺序错了会把旧事实白白退休掉。 */
     private Persisted persist(NewItem item) {
         return tx.execute(status -> {
-            Optional<UUID> existing = repo.findIdByKey(item.tenantId(), item.idemKey());
+            NewItem target = item;
+            Optional<MemoryRepository.Keyed> existing = repo.findByKey(target.tenantId(), target.idemKey());
             if (existing.isPresent()) {
-                return new Persisted(existing.get(), true, null, "idempotency key 已存在，未重复写入");
+                if (java.util.Objects.equals(existing.get().contentHash(), target.contentHash())) {
+                    return new Persisted(existing.get().id(), true, null, "idempotency key 已存在，未重复写入");
+                }
+                // 同一个键、内容却不同 ⇒ 这不是重投，是调用方把轮次计数从头数了一遍。
+                // 当成重复丢掉等于把新对话静默吞掉：线上实测同一会话今天的两轮
+                // 被三四天前 idx=1/idx=2 的旧记录顶掉，接口回 200、库里一条没有。
+                String retried = target.idemKey() + "~" + target.contentHash().substring(0, 8);
+                log.warn("幂等键被复用但内容不同：{} 已有别的记录，改用 {} 落库", target.idemKey(), retried);
+                target = target.withIdemKey(retried);
             }
+            final NewItem it = target;
             UUID supersedes = null;
-            if ("fact".equals(item.kind()) && item.subjectKey() != null && item.predicate() != null) {
-                Optional<MemoryRepository.ActiveFact> active = repo.findActiveFact(item.tenantId(),
-                        item.projectId(), item.subjectKey(), item.predicate());
+            if ("fact".equals(it.kind()) && it.subjectKey() != null && it.predicate() != null) {
+                Optional<MemoryRepository.ActiveFact> active = repo.findActiveFact(it.tenantId(),
+                        it.projectId(), it.subjectKey(), it.predicate());
                 if (active.isPresent()) {
                     MemoryRepository.ActiveFact old = active.get();
                     // 值没变就不是「新值」，是同一件事换了个说法。退休它等于用一条新描述
                     // 顶掉旧描述，历史白白闭合，而信息一点没增加。
-                    if (sameValue(old.objectValue(), item.objectValue())) {
+                    if (sameValue(old.objectValue(), it.objectValue())) {
                         return new Persisted(old.id(), true, null, "已有同值事实，未重复写入");
                     }
                     // 泛谓词是多值语义（「支持 X」与「支持 Y」并列），退休会把它们互相顶掉；
                     // 而排他约束又不允许两条 active 并存，所以只能保留先到的那条。
-                    if (isGenericPredicate(item.predicate())) {
+                    if (isGenericPredicate(it.predicate())) {
                         return new Persisted(old.id(), true, null, "泛谓词已有一条事实，未重复写入");
                     }
                     repo.retireFact(old.id());
@@ -525,20 +570,20 @@ public class IngestService {
             }
             // 替换旧事实时 valid_from 传 null，让 SQL 用 now()——retire 用的也是 now()，
             // 同一个事务时间戳，两条区间严丝合缝，不会因为 Java 侧早几毫秒而判定重叠。
-            OffsetDateTime validFrom = supersedes == null ? item.validFrom() : null;
-            NewItem withSupersedes = new NewItem(item.id(), item.tenantId(), item.tokenId(), item.userId(),
-                    item.projectId(),
-                    item.scope(), item.kind(), item.tier(), item.trustLevel(), item.subjectKey(),
-                    item.predicate(), item.objectValue(), item.factsJson(), item.narrative(),
-                    item.recallHints(), item.retrievalText(), item.searchText(),
-                    item.sourceKind(), item.sessionId(), item.turn(),
-                    item.confidence(), item.importance(), validFrom, item.contentHash(),
-                    item.idemKey(), supersedes);
+            OffsetDateTime validFrom = supersedes == null ? it.validFrom() : null;
+            NewItem withSupersedes = new NewItem(it.id(), it.tenantId(), it.tokenId(), it.userId(),
+                    it.projectId(),
+                    it.scope(), it.kind(), it.tier(), it.trustLevel(), it.subjectKey(),
+                    it.predicate(), it.objectValue(), it.factsJson(), it.narrative(),
+                    it.recallHints(), it.retrievalText(), it.searchText(),
+                    it.sourceKind(), it.sessionId(), it.turn(),
+                    it.confidence(), it.importance(), validFrom, it.contentHash(),
+                    it.idemKey(), supersedes);
             Optional<UUID> inserted = repo.insert(withSupersedes);
             // lambda 里只能引用 effectively final，supersedes 在上面的分支里被赋过值
             final UUID retired = supersedes;
             return inserted.map(id -> new Persisted(id, false, retired, null))
-                    .orElseGet(() -> new Persisted(repo.findIdByKey(item.tenantId(), item.idemKey())
+                    .orElseGet(() -> new Persisted(repo.findIdByKey(it.tenantId(), it.idemKey())
                             .orElseThrow(() -> new IllegalStateException("插入后既无新 id 也无既有 id")), true,
                             retired, "idempotency key 已存在，未重复写入"));
         });
@@ -925,11 +970,21 @@ public class IngestService {
     }
 
     /** 日志里只露个头：整段提示词打进 journal 会把它淹掉。 */
-    private static String head(String s) {        if (s == null) {
+    private static String head(String s) {
+        if (s == null) {
             return "";
         }
         String t = s.replaceAll("\\s+", " ").trim();
         return t.length() <= 40 ? t : t.substring(0, 40) + "…";
+    }
+
+    /** 尾巴同样重要：真问题常常在人设后面那两句里。 */
+    private static String tail(String s) {
+        if (s == null) {
+            return "";
+        }
+        String t = s.replaceAll("\\s+", " ").trim();
+        return t.length() <= 40 ? t : "…" + t.substring(t.length() - 40);
     }
 
     private static String blankToNull(String s) {

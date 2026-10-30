@@ -82,6 +82,18 @@ public class MemoryRepository {
         return ids.isEmpty() ? Optional.empty() : Optional.of(ids.get(0));
     }
 
+    /** 幂等键上已有的记录：id 加内容指纹，用来区分「重投」与「键被复用」。 */
+    public record Keyed(UUID id, String contentHash) {
+    }
+
+    public Optional<Keyed> findByKey(String tenantId, String idemKey) {
+        List<Keyed> rows = jdbc.query(
+                "select id, content_hash from memory_item where tenant_id = ? and idem_key = ?",
+                (rs, i) -> new Keyed(rs.getObject("id", UUID.class), rs.getString("content_hash")),
+                tenantId, idemKey);
+        return rows.isEmpty() ? Optional.empty() : Optional.of(rows.get(0));
+    }
+
     /** 同 (tenant, project, subject, predicate) 的 active 事实。 */
     public record ActiveFact(UUID id, String objectValue) {
     }

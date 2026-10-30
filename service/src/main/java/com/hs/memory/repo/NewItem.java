@@ -35,4 +35,11 @@ public record NewItem(
         String idemKey,
         UUID supersedesId
 ) {
+    /** 换一个幂等键（键被复用时用），其余字段不动。 */
+    public NewItem withIdemKey(String key) {
+        return new NewItem(id, tenantId, tokenId, userId, projectId, scope, kind, tier, trustLevel,
+                subjectKey, predicate, objectValue, factsJson, narrative, recallHints, retrievalText,
+                searchText, sourceKind, sessionId, turn, confidence, importance, validFrom,
+                contentHash, key, supersedesId);
+    }
 }
